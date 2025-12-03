@@ -1,0 +1,55 @@
+# Security: Never commit sensitive files
+secrets.h
+*.secrets
+*_secrets.h
+
+# Arduino IDE build files
+*.ino.bin
+*.ino.elf
+*.ino.hex
+*.ino.lst
+*.ino.map
+*.ino.s
+*.ino.su
+*.ino.d
+*.ino.cpp.o
+*.ino.c.o
+*.ino.s.o
+*.ino.obj
+*.ino.sym
+*.hex
+*.elf
+*.bin
+*.lst
+*.map
+*.s
+*.su
+*.d
+*.cpp.o
+*.c.o
+*.s.o
+*.obj
+*.sym
+build/
+*.o
+*.d
+
+# PlatformIO build files
+.pio/
+.vscode/
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
