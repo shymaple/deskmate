@@ -30,6 +30,8 @@
 #include <EEPROM.h>
 #include <Wire.h>
 #include <math.h>
+#include <DNSServer.h>    // Captive portal DNS redirect
+#include <ESPmDNS.h>      // deskmate.local hostname
 
 // SECURITY: Optional secrets file for local development only
 // Create secrets.h from secrets_template.h and define USE_SECRETS to enable
@@ -76,13 +78,15 @@ MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 MD_MAX72XX* mxHardware = NULL;
 
 
-// --- REMINDER STRUCTURE ---
-struct Reminder {
- bool enabled;
- int hour;
- int minute;
- char message[51]; // 50 chars + null terminator
+// --- BREAK TYPES (Water/Posture) ---
+enum BreakType : uint8_t {
+  WATER_BREAK = 0,
+  POSTURE_BREAK = 1
 };
+
+// Break intervals in minutes (stored in config)
+// Water: 15, 20, 30 minutes
+// Posture: 30, 45, 60 minutes
 
 
 // --- POMODORO PHASE STRUCTURE ---
@@ -93,34 +97,44 @@ struct PomodoroPhase {
 
 
 // --- CONFIGURATION STRUCTURE ---
-// CONFIG_VERSION: Increment this only when config structure changes in incompatible way
-// This ensures EEPROM data persists across firmware updates
-#define CONFIG_VERSION 1
+// CONFIG_VERSION: Increment when config structure changes in incompatible way
+#define CONFIG_VERSION 3  // Bumped for auto-weather and auto-brightness settings
 
 struct Config {
- uint8_t version; // Config version for migration/compatibility checking
- char ssid[32];
- char password[64];
- char ntpServer[64];
- long gmtOffset_sec;
- int daylightOffset_sec;
- char weatherApiKey[64];
- char lat[16];
- char lon[16];
- char cityName[32];
- int brightness;
- bool clockFormat24h; // true = 24h, false = 12h
- Reminder reminders[3]; // Max 3 reminders
- PomodoroPhase pomodoroPhases[4]; // 4 Pomodoro phases
- bool valid;
+  uint8_t version;
+  char ssid[32];
+  char password[64];
+  char ntpServer[64];
+  long gmtOffset_sec;
+  int daylightOffset_sec;
+  char weatherApiKey[64];
+  char lat[16];
+  char lon[16];
+  char cityName[32];
+  uint8_t brightness;          // 0-15, use uint8_t to save space
+  bool clockFormat24h;
+  // Break settings (replaces reminders - saves ~150 bytes)
+  bool waterBreakEnabled;      // Water break on/off
+  uint8_t waterIntervalMins;   // 15, 20, or 30 minutes
+  bool postureBreakEnabled;    // Posture break on/off
+  uint8_t postureIntervalMins; // 30, 45, or 60 minutes
+  // Auto-weather settings
+  bool autoWeatherEnabled;     // Enable 10-min auto weather display
+  // Auto-brightness settings
+  bool autoBrightnessEnabled;  // Enable day/night auto brightness
+  uint8_t dayBrightness;       // Brightness during day (0-15, default 5)
+  uint8_t nightBrightness;     // Brightness during night (0-15, default 2)
+  uint8_t nightStartHour;      // Hour when night starts (0-23, default 20 = 8 PM)
+  uint8_t nightEndHour;        // Hour when night ends (0-23, default 6 = 6 AM)
+  PomodoroPhase pomodoroPhases[4];
+  bool valid;
 };
-
 
 Config config;
 
 
 // --- EEPROM SETTINGS ---
-#define EEPROM_SIZE 1024  // Increased for reminders
+#define EEPROM_SIZE 512  // Reduced - no longer need space for reminders
 #define EEPROM_ADDR 0
 
 
@@ -131,6 +145,16 @@ WebServer server(80);
 // --- ACCESS POINT SETTINGS ---
 const char* ap_ssid = "ESP32-Clock";
 const char* ap_password = "clock123";
+
+
+// --- CAPTIVE PORTAL / DNS SERVER ---
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+const IPAddress apIP(192, 168, 4, 1);
+bool captivePortalActive = false;
+unsigned long lastDNSProcess = 0;
+const unsigned long DNS_PROCESS_INTERVAL = 10; // Process DNS every 10ms
+bool mdnsStarted = false;
 
 
 // --- GLOBAL STATE ---
@@ -144,18 +168,19 @@ int lastSyncedDay = -1; // Track last sync day
 
 
 // Display Mode State
-enum DisplayMode {
- MODE_CLOCK = 0,
- MODE_WEATHER = 1,
- MODE_REMINDER = 2,
- MODE_POMODORO = 3
+enum DisplayMode : uint8_t {
+  MODE_CLOCK = 0,
+  MODE_WEATHER = 1,
+  MODE_POMODORO = 2,
+  MODE_BREAK = 3      // Shared for water/posture breaks
 };
 DisplayMode currentMode = MODE_CLOCK;
+DisplayMode previousMode = MODE_CLOCK;  // For returning from weather/break
 
 
 // Blinking Colon for Clock
 unsigned long previousMillisColon = 0;
-const long colonBlinkInterval = 1000;
+const uint16_t colonBlinkInterval = 1000;
 bool colonVisible = true;
 
 
@@ -164,26 +189,40 @@ char weatherData[100] = "Loading...";
 bool weatherDataReady = false;
 
 
-// Reminder display buffer
-char reminderDisplayText[60] = "";
+// --- AUTO-WEATHER TIMER (every 10 min, show 10 sec) ---
+unsigned long lastAutoWeather = 0;
+const uint32_t AUTO_WEATHER_INTERVAL = 600000;  // 10 minutes in ms
+const uint32_t AUTO_WEATHER_DISPLAY_MS = 10000; // 10 seconds display
+const uint32_t FLIP_WEATHER_DISPLAY_MS = 15000; // 15 seconds for flip-triggered weather
+unsigned long weatherDisplayStart = 0;          // When weather display started
+bool autoWeatherActive = false;                 // Currently showing auto-weather
+bool flipWeatherActive = false;                 // Currently showing flip-triggered weather
 
 
-// Reminder tracking
-int lastCheckedMinute = -1;
-int lastCheckedHour = -1;
-int reminderScrollCount = 0; // Track how many times reminder has scrolled
-const int REMINDER_SCROLL_LOOPS = 3; // Show reminder 3 times
+// --- BREAK SYSTEM (shared for water/posture) ---
+char breakDisplayText[40] = "";  // Shared buffer for break messages
+BreakType activeBreakType = WATER_BREAK;  // Which break is currently active
+unsigned long lastWaterBreak = 0;   // Last water break trigger time
+unsigned long lastPostureBreak = 0; // Last posture break trigger time
+unsigned long breakDisplayStart = 0; // When break display started
+const uint32_t BREAK_DISPLAY_MAX_MS = 30000; // Max 30 sec display
+bool breakActive = false;           // Currently in break mode
 
 
 // Pomodoro timer state
 int currentPomodoroPhase = 0; // Current phase index (0-3)
-unsigned long pomodoroStartTime = 0; // When current phase started (millis)
-unsigned long pomodoroRemainingSeconds = 0; // Remaining seconds in current phase
-bool pomodoroPaused = false; // Pause state
-bool pomodoroTimerExpired = false; // Timer reached 00:00
-unsigned long pomodoroExpiredTime = 0; // When timer expired (for auto-return)
-const unsigned long POMODORO_AUTO_RETURN_MS = 300000; // 5 minutes = 300000ms
-unsigned long lastPomodoroUpdate = 0; // Last display update time
+unsigned long pomodoroStartTime = 0;
+unsigned long pomodoroRemainingSeconds = 0;
+bool pomodoroPaused = false;
+bool pomodoroTimerExpired = false;
+unsigned long pomodoroExpiredTime = 0;
+const unsigned long POMODORO_AUTO_RETURN_MS = 300000; // 5 min auto-return
+unsigned long lastPomodoroUpdate = 0;
+
+// Pomodoro gesture detection (shared accelerometer data)
+int16_t g_accelX = 0, g_accelY = 0, g_accelZ = 0;
+float g_magnitude = 0;
+bool g_sensorRead = false;
 bool pomodoroBlinkState = false; // For blinking display when expired
 unsigned long lastPomodoroBlink = 0; // Last blink toggle time
 const unsigned long POMODORO_BLINK_INTERVAL = 500; // Blink every 500ms
@@ -197,6 +236,11 @@ const int16_t LIFT_THRESHOLD = 5000; // Acceleration threshold for lift detectio
 bool flipDetected = false; // Flip detected flag
 unsigned long flipDetectedTime = 0; // When flip was detected
 const unsigned long FLIP_DEBOUNCE_MS = 500; // Require 500ms stable flip
+// Phase start animation (3 blinks when new phase starts)
+bool phaseStartBlinking = false;       // Currently in phase start animation
+uint8_t phaseStartBlinkCount = 0;      // Number of blinks completed
+unsigned long phaseStartBlinkTime = 0; // Last blink toggle time
+const uint8_t PHASE_START_BLINK_TOTAL = 6; // 6 toggles = 3 blinks (on-off-on-off-on-off)
 
 
 // MPU6050 orientation tracking
@@ -321,6 +365,7 @@ const char* htmlPage = R"HTML(
    .status { padding: 10px; margin-bottom: 15px; font-size: 12px; display: none; }
    .status.success { background: #d4edda; color: #155724; display: block; }
    .status.error { background: #f8d7da; color: #721c24; display: block; }
+   .status.saving { background: #cce5ff; color: #004085; display: block; }
    .info { background: #e7f3ff; padding: 10px; font-size: 11px; margin-bottom: 15px; }
  </style>
 </head>
@@ -345,7 +390,10 @@ const char* htmlPage = R"HTML(
        </div>
        <div class="form-group">
          <label>Password</label>
-         <input type="password" id="password" name="password">
+         <div style="position:relative;">
+           <input type="password" id="password" name="password" style="padding-right:60px;">
+           <button type="button" id="togglePwd" onclick="togglePassword()" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);padding:4px 8px;font-size:11px;background:#f0f0f0;border:1px solid #ccc;border-radius:4px;cursor:pointer;">Show</button>
+         </div>
        </div>
      </div>
     
@@ -404,38 +452,96 @@ const char* htmlPage = R"HTML(
      </div>
     
      <div class="section">
-       <div class="section-title">Reminders (Max 5)</div>
-       <div id="remindersContainer">
-         <!-- Reminders will be added here by JavaScript -->
+       <div class="section-title">Break Reminders</div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <input type="checkbox" id="waterBreakEnabled" name="waterBreakEnabled" style="width:auto;">
+         <label for="waterBreakEnabled" style="margin:0;">Water Break</label>
+         <select id="waterInterval" name="waterInterval" style="margin-left:auto;">
+           <option value="15">15 min</option>
+           <option value="20">20 min</option>
+           <option value="30">30 min</option>
+         </select>
        </div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <input type="checkbox" id="postureBreakEnabled" name="postureBreakEnabled" style="width:auto;">
+         <label for="postureBreakEnabled" style="margin:0;">Posture Break</label>
+         <select id="postureInterval" name="postureInterval" style="margin-left:auto;">
+           <option value="30">30 min</option>
+           <option value="45">45 min</option>
+           <option value="60">60 min</option>
+         </select>
+       </div>
+       <div class="help">Breaks only trigger in Clock mode. Flip device to dismiss.</div>
      </div>
-    
+
+     <div class="section">
+       <div class="section-title">Weather Display</div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <input type="checkbox" id="autoWeatherEnabled" name="autoWeatherEnabled" style="width:auto;">
+         <label for="autoWeatherEnabled" style="margin:0;">Auto-weather every 10 min</label>
+       </div>
+       <div class="help">Flip device in Clock mode to show weather for 15 sec anytime.</div>
+     </div>
+
+     <div class="section">
+       <div class="section-title">Auto Brightness</div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <input type="checkbox" id="autoBrightnessEnabled" name="autoBrightnessEnabled" style="width:auto;">
+         <label for="autoBrightnessEnabled" style="margin:0;">Enable day/night auto brightness</label>
+       </div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <label style="width:100px;">Day (0-15)</label>
+         <input type="number" id="dayBrightness" name="dayBrightness" min="0" max="15" value="5" style="width:60px;">
+         <label style="width:100px;margin-left:15px;">Night (0-15)</label>
+         <input type="number" id="nightBrightness" name="nightBrightness" min="0" max="15" value="2" style="width:60px;">
+       </div>
+       <div class="form-group" style="display:flex;align-items:center;gap:10px;">
+         <label style="width:100px;">Night starts</label>
+         <select id="nightStartHour" name="nightStartHour" style="width:80px;">
+           <option value="18">6 PM</option>
+           <option value="19">7 PM</option>
+           <option value="20">8 PM</option>
+           <option value="21">9 PM</option>
+           <option value="22">10 PM</option>
+           <option value="23">11 PM</option>
+         </select>
+         <label style="width:100px;margin-left:15px;">Night ends</label>
+         <select id="nightEndHour" name="nightEndHour" style="width:80px;">
+           <option value="5">5 AM</option>
+           <option value="6">6 AM</option>
+           <option value="7">7 AM</option>
+           <option value="8">8 AM</option>
+         </select>
+       </div>
+       <div class="help">Brightness adjusts automatically based on your timezone.</div>
+     </div>
+
      <div class="section">
        <div class="section-title">Pomodoro Timer</div>
        <div class="form-group">
-         <label>Phase 1: Duration (minutes)</label>
+         <label>Phase 1: Focus (minutes)</label>
          <input type="number" id="pomodoroPhase0Duration" name="pomodoroPhase0Duration" min="1" max="120" value="60">
        </div>
        <div class="form-group">
-         <label>Phase 2: Duration (minutes)</label>
+         <label>Phase 2: Short Break (minutes)</label>
          <input type="number" id="pomodoroPhase1Duration" name="pomodoroPhase1Duration" min="1" max="120" value="5">
        </div>
        <div class="form-group">
-         <label>Phase 3: Duration (minutes)</label>
+         <label>Phase 3: Focus (minutes)</label>
          <input type="number" id="pomodoroPhase2Duration" name="pomodoroPhase2Duration" min="1" max="120" value="30">
        </div>
        <div class="form-group">
-         <label>Phase 4: Duration (minutes)</label>
+         <label>Phase 4: Long Break (minutes)</label>
          <input type="number" id="pomodoroPhase3Duration" name="pomodoroPhase3Duration" min="1" max="120" value="10">
        </div>
        <div class="help" style="margin-top: 10px;">
-         <strong>Usage:</strong> Press button to cycle: Clock to Weather to Pomodoro to Clock<br>
-         <strong>Flip device 180 degrees</strong> to advance to next phase<br>
-         <strong>Lift and put back</strong> to pause/resume timer
+         <strong>Usage:</strong> Press button to toggle: Clock &harr; Pomodoro<br>
+         <strong>Flip device 180&deg;</strong> to advance phase<br>
+         <strong>Lift and put back</strong> to pause/resume
        </div>
      </div>
     
-     <button type="submit" class="btn"> Save & Apply</button>
+     <button type="submit" class="btn" id="saveBtn">Save & Apply</button>
    </form>
  </div>
   <script>
@@ -443,7 +549,21 @@ const char* htmlPage = R"HTML(
      const status = document.getElementById('status');
      status.className = 'status ' + type;
      status.textContent = msg;
-     setTimeout(() => status.className = 'status', 5000);
+     if (type !== 'saving') {
+       setTimeout(() => status.className = 'status', 5000);
+     }
+   }
+
+   function togglePassword() {
+     const pwd = document.getElementById('password');
+     const btn = document.getElementById('togglePwd');
+     if (pwd.type === 'password') {
+       pwd.type = 'text';
+       btn.textContent = 'Hide';
+     } else {
+       pwd.type = 'password';
+       btn.textContent = 'Show';
+     }
    }
   
    function updateStatus() {
@@ -475,13 +595,22 @@ const char* htmlPage = R"HTML(
          document.getElementById('brightness').value = data.brightness || 5;
          document.getElementById('clockFormat').value = data.clockFormat24h ? '24' : '12';
         
-         // Load reminders
-         if (data.reminders) {
-           loadReminders(data.reminders);
-         } else {
-           createReminderForms();
-         }
-         
+         // Load break settings
+         document.getElementById('waterBreakEnabled').checked = data.waterBreakEnabled !== false;
+         document.getElementById('waterInterval').value = data.waterIntervalMins || 15;
+         document.getElementById('postureBreakEnabled').checked = data.postureBreakEnabled !== false;
+         document.getElementById('postureInterval').value = data.postureIntervalMins || 30;
+
+         // Load auto-weather setting
+         document.getElementById('autoWeatherEnabled').checked = data.autoWeatherEnabled !== false;
+
+         // Load auto-brightness settings
+         document.getElementById('autoBrightnessEnabled').checked = data.autoBrightnessEnabled !== false;
+         document.getElementById('dayBrightness').value = data.dayBrightness || 5;
+         document.getElementById('nightBrightness').value = data.nightBrightness || 2;
+         document.getElementById('nightStartHour').value = data.nightStartHour || 20;
+         document.getElementById('nightEndHour').value = data.nightEndHour || 6;
+
          // Load Pomodoro phases
          if (data.pomodoroPhases && Array.isArray(data.pomodoroPhases)) {
            for (let i = 0; i < 4; i++) {
@@ -491,75 +620,47 @@ const char* htmlPage = R"HTML(
            }
          }
        })
-       .catch(err => {
-         console.log('Error loading config:', err);
-         createReminderForms();
-       });
+       .catch(err => console.log('Error loading config:', err));
    };
-  
-   function createReminderForms() {
-     const container = document.getElementById('remindersContainer');
-     container.innerHTML = "";
-     for (let i = 0; i < 3; i++) {
-       const reminderDiv = document.createElement('div');
-       reminderDiv.className = 'form-group';
-       reminderDiv.style.border = '1px solid #e0e0e0';
-       reminderDiv.style.padding = '15px';
-       reminderDiv.style.borderRadius = '6px';
-       reminderDiv.style.marginBottom = '10px';
-       reminderDiv.innerHTML = 
-         "<div style=\"display: flex; align-items: center; margin-bottom: 10px;\">" +
-           "<input type=\"checkbox\" id=\"reminder" + i + "Enabled\" name=\"reminder" + i + "Enabled\" style=\"width: auto; margin-right: 8px;\">" +
-           "<label style=\"margin: 0; font-weight: 600;\">Reminder " + (i + 1) + "</label>" +
-         "</div>" +
-         "<div style=\"display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 10px;\">" +
-           "<div>" +
-             "<label style=\"font-size: 11px;\">Hour (0-23)</label>" +
-             "<input type=\"number\" id=\"reminder" + i + "Hour\" name=\"reminder" + i + "Hour\" min=\"0\" max=\"23\" value=\"0\" style=\"width: 100%;\">" +
-           "</div>" +
-           "<div>" +
-             "<label style=\"font-size: 11px;\">Minute (0-59)</label>" +
-             "<input type=\"number\" id=\"reminder" + i + "Minute\" name=\"reminder" + i + "Minute\" min=\"0\" max=\"59\" value=\"0\" style=\"width: 100%;\">" +
-           "</div>" +
-           "<div>" +
-             "<label style=\"font-size: 11px;\">Message (max 50 chars)</label>" +
-             "<input type=\"text\" id=\"reminder" + i + "Message\" name=\"reminder" + i + "Message\" maxlength=\"50\" placeholder=\"Reminder message\" style=\"width: 100%;\">" +
-           "</div>" +
-         "</div>";
-       container.appendChild(reminderDiv);
-     }
-   }
-  
-   function loadReminders(reminders) {
-     createReminderForms();
-     if (reminders && Array.isArray(reminders)) {
-       reminders.forEach((reminder, i) => {
-         if (reminder) {
-           document.getElementById('reminder' + i + 'Enabled').checked = reminder.enabled || false;
-           document.getElementById('reminder' + i + 'Hour').value = reminder.hour || 0;
-           document.getElementById('reminder' + i + 'Minute').value = reminder.minute || 0;
-           document.getElementById('reminder' + i + 'Message').value = reminder.message || "";
-         }
-       });
-     }
-   }
-  
+
    document.getElementById('configForm').onsubmit = function(e) {
      e.preventDefault();
+     const btn = document.getElementById('saveBtn');
+     const origText = btn.textContent;
+
+     // Show saving state
+     btn.disabled = true;
+     btn.textContent = 'Saving...';
+     btn.style.opacity = '0.7';
+     showStatus('Saving settings to device...', 'saving');
+
      const formData = new FormData(this);
-    
+
      fetch('/save', {
        method: 'POST',
        body: formData
      })
      .then(r => r.text())
      .then(data => {
+       btn.disabled = false;
+       btn.textContent = origText;
+       btn.style.opacity = '1';
+
        if (data.includes('success')) {
-         showStatus('Saved! Device will reconnect...', 'success');
-         setTimeout(() => updateStatus(), 2000);
+         showStatus('Settings saved! Applying changes...', 'success');
+         setTimeout(() => {
+           showStatus('Done! Settings applied.', 'success');
+           updateStatus();
+         }, 2000);
        } else {
-         showStatus('Error saving', 'error');
+         showStatus('Error: Could not save settings', 'error');
        }
+     })
+     .catch(err => {
+       btn.disabled = false;
+       btn.textContent = origText;
+       btn.style.opacity = '1';
+       showStatus('Network error. Please try again.', 'error');
      });
    };
  </script>
@@ -579,22 +680,38 @@ void showWiFiConnecting();
 void handleButton();
 void updateClockDisplay();
 void startWeatherScroll();
-void showReminder(const char* message);
+void startAutoWeather();
+void startFlipWeather();
+void checkAutoBrightness();
+void handleBreak(BreakType type);
+void checkBreaks();
+void dismissBreak();
 void initMPU6050();
 bool checkMPU6050();
 void checkOrientation();
 int16_t readMPU6050Accel(int reg);
 void flipDisplayHardware(bool flipped);
+textEffect_t getScrollEffect();  // Returns correct scroll direction based on flip state
 void handleRoot();
 void handleConfig();
 void handleSave();
 void handleStatus();
+// Captive portal functions
+void handleCaptivePortalRedirect();
+void handleAndroidCaptive();
+void handleAppleCaptive();
+void handleWindowsCaptive();
+void handleFirefoxCaptive();
+void handleNotFound();
+void startCaptivePortal();
+void stopCaptivePortal();
 // Pomodoro functions
 void startPomodoroMode();
 void updatePomodoroDisplay();
 void advancePomodoroPhase();
 void pausePomodoro();
 void resumePomodoro();
+void readPomodoroAccel();
 void checkPomodoroLift();
 void checkPomodoroFlip();
 
@@ -642,9 +759,21 @@ void setup() {
  server.on("/config", handleConfig);
  server.on("/save", handleSave);
  server.on("/status", handleStatus);
+
+ // Captive portal detection routes
+ server.on("/generate_204", handleAndroidCaptive);      // Android
+ server.on("/gen_204", handleAndroidCaptive);           // Android alt
+ server.on("/hotspot-detect.html", handleAppleCaptive); // Apple iOS/macOS
+ server.on("/library/test/success.html", handleAppleCaptive); // Apple alt
+ server.on("/connecttest.txt", handleWindowsCaptive);   // Windows
+ server.on("/ncsi.txt", handleWindowsCaptive);          // Windows alt
+ server.on("/success.txt", handleFirefoxCaptive);       // Firefox
+ server.on("/canonical.html", handleFirefoxCaptive);    // Firefox alt
+ server.onNotFound(handleNotFound);                     // Catch-all
+
  server.begin();
- Serial.println("Web server started");
-  // Show AP info immediately
+ Serial.println("[WEB] Server started with captive portal routes");
+  // Show AP info
  Serial.println("\n=== Access Point Started ===");
  Serial.print("AP SSID: ");
  Serial.println(ap_ssid);
@@ -652,10 +781,18 @@ void setup() {
  Serial.println(ap_password);
  Serial.print("AP IP: ");
  Serial.println(WiFi.softAPIP());
- Serial.println("Open: http://192.168.4.1");
+ Serial.println("Open: http://192.168.4.1 or http://deskmate.local");
+ Serial.println("Captive portal active - popup will appear on connect");
  Serial.println("===========================\n");
-  P.displayZoneText(0, "CONFIG", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+
+ // Show IP address briefly on display
+ P.displayZoneText(0, "192.168", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
  P.displayAnimate();
+ delay(1000);
+ P.displayZoneText(0, "4.1", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+ P.displayAnimate();
+ delay(1000);
+
   // Try to connect to WiFi if SSID is configured (in background, AP still works)
  if (strlen(config.ssid) > 0) {
    Serial.println("Attempting WiFi connection in background...");
@@ -663,8 +800,10 @@ void setup() {
    P.displayAnimate();
    connectWiFi();
  }
+
   // Wait a bit for WiFi connection attempt
  delay(2000);
+
   // If WiFi connected, sync time and get weather
  if (WiFi.status() == WL_CONNECTED) {
    wifiConnected = true;
@@ -673,30 +812,63 @@ void setup() {
    Serial.println(WiFi.localIP());
    Serial.print("AP IP (still available): ");
    Serial.println(WiFi.softAPIP());
-  
+
+   P.displayZoneText(0, "SYNC", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+   P.displayAnimate();
    syncNTP();
-  
+
    P.displayZoneText(0, "READY", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
    P.displayAnimate();
    delay(1000);
-  
+
    getLocalTime(&timeinfo);
    strftime(timeYesterday, 4, "%a", &timeinfo);
    strftime(timeLastHour, 3, "%H", &timeinfo);
-  
+
    getWeather();
-  
+
    P.displayClear();
    currentMode = MODE_CLOCK;
    colonVisible = true;
+
+   // Initialize break and auto-weather timers (start counting from now)
+   unsigned long now = millis();
+   lastWaterBreak = now;
+   lastPostureBreak = now;
+   lastAutoWeather = now;
+
+   // Apply auto-brightness based on time of day
+   checkAutoBrightness();
+
    updateClockDisplay();
  } else {
-   Serial.println("\nWiFi connection failed - AP mode active");
+   Serial.println("\nWiFi not configured or connection failed - AP mode active");
    Serial.println("Connect to WiFi network: ESP32-Clock");
    Serial.println("Password: clock123");
-   Serial.println("Then open: http://192.168.4.1");
-  
-   // Show "CONFIG" on display
+   Serial.println("A captive portal popup should appear automatically!");
+   Serial.println("Or open: http://192.168.4.1 or http://deskmate.local");
+
+   // Show scrolling instruction
+   P.displayClear();
+   textEffect_t scrollDir = getScrollEffect();
+   P.displayZoneText(0, "CONNECT TO ESP32-CLOCK WIFI    ", PA_LEFT, 80, 0, scrollDir, scrollDir);
+
+   // Wait for scroll to complete (non-blocking in loop will handle it)
+   unsigned long scrollStart = millis();
+   while (millis() - scrollStart < 5000) {
+     if (P.displayAnimate()) {
+       // Scroll complete
+       break;
+     }
+     server.handleClient();
+     if (captivePortalActive) {
+       dnsServer.processNextRequest();
+     }
+     delay(10);
+   }
+
+   // Show CONFIG after scroll
+   P.displayClear();
    P.displayZoneText(0, "CONFIG", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
    P.displayAnimate();
  }
@@ -706,6 +878,16 @@ void setup() {
 void loop() {
  // Handle web server
  server.handleClient();
+
+ // Process DNS server for captive portal
+ if (captivePortalActive) {
+   unsigned long now = millis();
+   if (now - lastDNSProcess >= DNS_PROCESS_INTERVAL) {
+     lastDNSProcess = now;
+     dnsServer.processNextRequest();
+   }
+ }
+
   // Handle button input
  handleButton();
   // Keep animations running
@@ -803,57 +985,77 @@ void loop() {
      }
    }
  }
-  // --- WEATHER MODE ---
- else if (currentMode == MODE_WEATHER) {
-   if (P.getZoneStatus(0)) {
-     Serial.println("Weather scroll complete, returning to clock");
-     currentMode = MODE_CLOCK;
-     P.displayClear();
-     colonVisible = true;
-     updateClockDisplay();
-   }
- }
-  // --- REMINDER MODE ---
- else if (currentMode == MODE_REMINDER) {
-   if (P.getZoneStatus(0)) {
-     reminderScrollCount++;
-     Serial.print("Reminder scroll complete (loop ");
-     Serial.print(reminderScrollCount);
-     Serial.print(" of ");
-     Serial.print(REMINDER_SCROLL_LOOPS);
-     Serial.println(")");
-    
-     if (reminderScrollCount >= REMINDER_SCROLL_LOOPS) {
-       // All loops complete, return to clock
-       Serial.println("Reminder display finished, returning to clock");
-       reminderScrollCount = 0;
-       currentMode = MODE_CLOCK;
-       P.displayClear();
-       colonVisible = true;
-       updateClockDisplay();
-     } else {
-       // Restart scroll for next loop
-       delay(500); // Brief pause between loops
-       // Restart the scroll with the stored reminder text
-       if (strlen(reminderDisplayText) > 0) {
-         P.displayClear();
-         P.displayZoneText(0, reminderDisplayText, PA_LEFT, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-         P.displayAnimate();
-         Serial.print("Restarting reminder scroll (loop ");
-         Serial.print(reminderScrollCount + 1);
-         Serial.println(")");
-       }
-     }
-   }
- }
-  // --- POMODORO MODE ---
- else if (currentMode == MODE_POMODORO) {
-   // Check for lift (pause/resume) - only every 2 seconds to save battery
-   if (currentMillis - lastOrientationCheck >= orientationCheckInterval) {
-     lastOrientationCheck = currentMillis;
-     checkPomodoroLift();
-     checkPomodoroFlip();
-   }
+   // --- WEATHER MODE (auto-weather 10-sec, flip-weather 15-sec) ---
+  else if (currentMode == MODE_WEATHER) {
+    // Check if flip-triggered weather 15-second display time is up
+    if (flipWeatherActive && (currentMillis - weatherDisplayStart >= FLIP_WEATHER_DISPLAY_MS)) {
+      Serial.println("[FLIP-WEATHER] 15 seconds elapsed, returning to clock");
+      flipWeatherActive = false;
+      currentMode = MODE_CLOCK;
+      P.displayClear();
+      colonVisible = true;
+      updateClockDisplay();
+    }
+    // Check if auto-weather 10-second display time is up
+    else if (autoWeatherActive && (currentMillis - weatherDisplayStart >= AUTO_WEATHER_DISPLAY_MS)) {
+      Serial.println("[AUTO-WEATHER] 10 seconds elapsed, returning to clock");
+      autoWeatherActive = false;
+      currentMode = MODE_CLOCK;
+      P.displayClear();
+      colonVisible = true;
+      updateClockDisplay();
+    }
+    // Also return when scroll completes (for short weather messages)
+    else if (P.getZoneStatus(0)) {
+      if (autoWeatherActive || flipWeatherActive) {
+        // Restart scroll to fill display time
+        startWeatherScroll();
+      } else {
+        // Manual weather (shouldn't happen with new button logic, but safe)
+        currentMode = MODE_CLOCK;
+        P.displayClear();
+        colonVisible = true;
+        updateClockDisplay();
+      }
+    }
+  }
+  // --- BREAK MODE (water/posture breaks) ---
+  else if (currentMode == MODE_BREAK) {
+    // Check for flip to dismiss break
+    if (currentMillis - lastOrientationCheck >= orientationCheckInterval) {
+      lastOrientationCheck = currentMillis;
+      // Check if device was flipped to dismiss
+      int16_t accelZ = readMPU6050Accel(MPU6050_ACCEL_ZOUT_H);
+      bool currentlyFlipped = (accelZ < -8000);
+      if (currentlyFlipped != displayFlipped) {
+        Serial.println("[BREAK] Flip detected - dismissing break");
+        dismissBreak();
+      }
+    }
+
+    // Check 30-second max timeout
+    if (currentMillis - breakDisplayStart >= BREAK_DISPLAY_MAX_MS) {
+      Serial.println("[BREAK] 30-second timeout reached");
+      dismissBreak();
+    }
+
+    // Restart scroll if completed (keep showing until timeout or flip)
+    if (P.getZoneStatus(0) && breakActive) {
+      textEffect_t scrollDir = getScrollEffect();
+      P.displayZoneText(0, breakDisplayText, PA_LEFT, 80, 0, scrollDir, scrollDir);
+      P.displayAnimate();
+    }
+  }
+   // --- POMODORO MODE ---
+  else if (currentMode == MODE_POMODORO) {
+    // Check for gestures every 200ms (faster than clock mode for responsiveness)
+    if (currentMillis - lastOrientationCheck >= 200) {
+      lastOrientationCheck = currentMillis;
+      g_sensorRead = false;  // Reset so accelerometer is read fresh
+      readPomodoroAccel();   // Read once, shared by both functions
+      checkPomodoroLift();   // Check lift first (to lock flip during lift)
+      checkPomodoroFlip();   // Then check flip
+    }
    
    // Update timer display every second
    if (currentMillis - lastPomodoroUpdate >= 1000) {
@@ -885,30 +1087,27 @@ void loop() {
      updateClockDisplay();
    }
  }
-  // Check for reminders (only in clock mode)
- if (currentMode == MODE_CLOCK && getLocalTime(&timeinfo)) {
-   int currentHour = timeinfo.tm_hour;
-   int currentMinute = timeinfo.tm_min;
-  
-   // Check once per minute
-   if (currentMinute != lastCheckedMinute || currentHour != lastCheckedHour) {
-     lastCheckedMinute = currentMinute;
-     lastCheckedHour = currentHour;
-    
-     // Check all reminders
-     for (int i = 0; i < 3; i++) {
-       if (config.reminders[i].enabled &&
-           config.reminders[i].hour == currentHour &&
-           config.reminders[i].minute == currentMinute) {
-         // Trigger reminder
-         Serial.print("Reminder triggered: ");
-         Serial.println(config.reminders[i].message);
-         showReminder(config.reminders[i].message);
-         break; // Only show one reminder at a time
-       }
-     }
-   }
- }
+   // --- CLOCK MODE: Check breaks and auto-weather ---
+  if (currentMode == MODE_CLOCK) {
+    // Check breaks first (highest priority)
+    checkBreaks();
+
+    // Check auto-weather (every 10 minutes, only if enabled and not in break)
+    if (currentMode == MODE_CLOCK && wifiConnected && config.autoWeatherEnabled) {
+      if (currentMillis - lastAutoWeather >= AUTO_WEATHER_INTERVAL) {
+        lastAutoWeather = currentMillis;
+        Serial.println("[AUTO-WEATHER] 10-minute interval reached");
+        startAutoWeather();
+      }
+    }
+
+    // Check auto-brightness (based on time of day)
+    static unsigned long lastBrightnessCheck = 0;
+    if (currentMillis - lastBrightnessCheck >= 60000) {  // Check every minute
+      lastBrightnessCheck = currentMillis;
+      checkAutoBrightness();
+    }
+  }
 }
 
 
@@ -984,19 +1183,29 @@ void loadConfig() {
    #endif
    
    // Safe defaults (not sensitive)
-   strcpy(config.ntpServer, "pool.ntp.org");
-   config.gmtOffset_sec = 0; // UTC - user should configure their timezone
-   config.daylightOffset_sec = 0;
-   config.brightness = 5;
-   config.clockFormat24h = true; // Default to 24h format
-   // Initialize reminders
-   for (int i = 0; i < 3; i++) {
-     config.reminders[i].enabled = false;
-     config.reminders[i].hour = 0;
-     config.reminders[i].minute = 0;
-     strcpy(config.reminders[i].message, "");
-   }
-   // Initialize Pomodoro phases with defaults
+    strcpy(config.ntpServer, "pool.ntp.org");
+    config.gmtOffset_sec = 0; // UTC - user should configure their timezone
+    config.daylightOffset_sec = 0;
+    config.brightness = 5;
+    config.clockFormat24h = true; // Default to 24h format
+
+    // Initialize break settings with defaults
+    config.waterBreakEnabled = true;    // Water break ON by default
+    config.waterIntervalMins = 15;      // 15 minutes default
+    config.postureBreakEnabled = true;  // Posture break ON by default
+    config.postureIntervalMins = 30;    // 30 minutes default
+
+    // Initialize auto-weather settings
+    config.autoWeatherEnabled = true;   // Auto-weather ON by default
+
+    // Initialize auto-brightness settings
+    config.autoBrightnessEnabled = true;  // Auto-brightness ON by default
+    config.dayBrightness = 5;             // Day brightness (default 5)
+    config.nightBrightness = 2;           // Night brightness (default 2)
+    config.nightStartHour = 20;           // Night starts at 8 PM
+    config.nightEndHour = 6;              // Night ends at 6 AM
+
+    // Initialize Pomodoro phases with defaults
    config.pomodoroPhases[0].durationMinutes = 60;
    strcpy(config.pomodoroPhases[0].name, "FOCUS");
    config.pomodoroPhases[1].durationMinutes = 5;
@@ -1069,95 +1278,182 @@ void saveConfig() {
 
 
 void setupAP() {
- // Disconnect any existing connections first
- WiFi.disconnect(true);
- delay(200);
-  
- // Set to AP_STA mode to allow both AP and Station simultaneously
- WiFi.mode(WIFI_AP_STA);
- delay(200);
-  
- // Configure AP with explicit channel and max connections
- // Use channel 1, not hidden, max 4 connections
- bool apStarted = WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
-  
- if (!apStarted) {
-   Serial.println("ERROR: AP setup failed! Retrying...");
-   delay(500);
-   // Try again with AP mode only
-   WiFi.mode(WIFI_AP);
-   delay(200);
-   apStarted = WiFi.softAP(ap_ssid, ap_password);
- }
-  
- if (apStarted) {
-   // Give AP more time to fully initialize
-   delay(1000);
-   
-   // Verify AP is actually running
-   int retries = 0;
-   while (WiFi.softAPIP().toString() == "0.0.0.0" && retries < 10) {
-     delay(200);
-     retries++;
-   }
-   
-   IPAddress IP = WiFi.softAPIP();
-   if (IP.toString() != "0.0.0.0") {
-     Serial.print("✓ AP started successfully!");
-     Serial.print(" SSID: ");
-     Serial.print(ap_ssid);
-     Serial.print(" IP: ");
-     Serial.println(IP);
-     Serial.print("AP MAC: ");
-     Serial.println(WiFi.softAPmacAddress());
-   } else {
-     Serial.println("ERROR: AP started but IP not assigned!");
-   }
- } else {
-   Serial.println("ERROR: AP failed to start after retry!");
- }
+  Serial.println("[AP] Starting Access Point setup...");
+
+  // Show progress on display
+  P.displayZoneText(0, "AP...", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+  P.displayAnimate();
+
+  // Disconnect any existing connections first
+  WiFi.disconnect(true);
+  WiFi.softAPdisconnect(true);
+  delay(300);
+
+  // Set to AP_STA mode to allow both AP and Station simultaneously
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+
+  // Configure AP with channel 6 (less congested than 1)
+  // Parameters: ssid, password, channel, hidden, max_connections
+  bool apStarted = WiFi.softAP(ap_ssid, ap_password, 6, 0, 4);
+
+  if (!apStarted) {
+    Serial.println("[AP] ERROR: First attempt failed! Retrying...");
+    P.displayZoneText(0, "RETRY", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+    P.displayAnimate();
+    delay(500);
+
+    // Try with AP-only mode
+    WiFi.mode(WIFI_AP);
+    delay(300);
+    apStarted = WiFi.softAP(ap_ssid, ap_password, 6, 0, 4);
+  }
+
+  if (!apStarted) {
+    Serial.println("[AP] ERROR: Second attempt failed! Trying channel 1...");
+    delay(500);
+    apStarted = WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
+  }
+
+  if (apStarted) {
+    // Configure AP IP address explicitly for reliability
+    delay(100);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+
+    // Wait for AP to be fully ready (up to 3 seconds)
+    int retries = 0;
+    while (WiFi.softAPIP().toString() == "0.0.0.0" && retries < 30) {
+      delay(100);
+      retries++;
+    }
+
+    IPAddress IP = WiFi.softAPIP();
+    if (IP.toString() != "0.0.0.0") {
+      Serial.println("[AP] SUCCESS!");
+      Serial.print("[AP] SSID: ");
+      Serial.println(ap_ssid);
+      Serial.print("[AP] IP: ");
+      Serial.println(IP);
+      Serial.print("[AP] MAC: ");
+      Serial.println(WiFi.softAPmacAddress());
+      Serial.print("[AP] Channel: ");
+      Serial.println(WiFi.channel());
+
+      // Start captive portal DNS server
+      startCaptivePortal();
+
+      P.displayZoneText(0, "AP OK", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      P.displayAnimate();
+    } else {
+      Serial.println("[AP] ERROR: AP started but IP not assigned!");
+      P.displayZoneText(0, "AP IP?", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+      P.displayAnimate();
+    }
+  } else {
+    Serial.println("[AP] ERROR: AP failed to start after all retries!");
+    P.displayZoneText(0, "AP ERR", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+    P.displayAnimate();
+  }
 }
 
 
 void connectWiFi() {
- Serial.print("Connecting to WiFi: ");
- Serial.println(config.ssid);
+  Serial.println("\n=== WiFi Connection Attempt ===");
+  Serial.print("SSID: ");
+  Serial.println(config.ssid);
+  Serial.print("SSID length: ");
+  Serial.println(strlen(config.ssid));
+  Serial.print("Password length: ");
+  Serial.println(strlen(config.password));
+
+  // Check if credentials are valid
+  if (strlen(config.ssid) == 0) {
+    Serial.println("✗ No SSID configured");
+    wifiConnected = false;
+    return;
+  }
+
+  // Disconnect any existing connection first
+  WiFi.disconnect(true);
+  delay(100);
+
   // Ensure we're in AP_STA mode so AP stays active
- if (WiFi.getMode() != WIFI_AP_STA) {
-   WiFi.mode(WIFI_AP_STA);
-   delay(100);
-   // Restart AP if needed
-   if (!WiFi.softAP(ap_ssid, ap_password)) {
-     Serial.println("Warning: Could not restart AP");
-   }
- }
-  // Begin WiFi connection (non-blocking, AP still works)
- WiFi.begin(config.ssid, config.password);
+  WiFi.mode(WIFI_AP_STA);
+  delay(200);
+
+  // Ensure AP is running
+  if (WiFi.softAPgetStationNum() >= 0) {
+    Serial.println("[AP] AP mode active");
+  } else {
+    Serial.println("[AP] Restarting AP...");
+    WiFi.softAP(ap_ssid, ap_password, 6); // Channel 6
+  }
+  delay(100);
+
+  // Begin WiFi connection
+  Serial.println("Calling WiFi.begin()...");
+  WiFi.begin(config.ssid, config.password);
+
   unsigned long startAttempt = millis();
- int attempts = 0;
- while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-   delay(500);
-   showWiFiConnecting();
-   Serial.print(".");
-   attempts++;
-  
-   // Keep web server responsive
-   server.handleClient();
- }
+  int attempts = 0;
+  wl_status_t lastStatus = WL_IDLE_STATUS;
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 20000) {
+    delay(500);
+    showWiFiConnecting();
+
+    wl_status_t currentStatus = WiFi.status();
+    if (currentStatus != lastStatus) {
+      Serial.print("\nWiFi status: ");
+      switch (currentStatus) {
+        case WL_IDLE_STATUS: Serial.println("IDLE"); break;
+        case WL_NO_SSID_AVAIL: Serial.println("NO_SSID_AVAIL - Network not found!"); break;
+        case WL_SCAN_COMPLETED: Serial.println("SCAN_COMPLETED"); break;
+        case WL_CONNECTED: Serial.println("CONNECTED"); break;
+        case WL_CONNECT_FAILED: Serial.println("CONNECT_FAILED - Wrong password?"); break;
+        case WL_CONNECTION_LOST: Serial.println("CONNECTION_LOST"); break;
+        case WL_DISCONNECTED: Serial.println("DISCONNECTED"); break;
+        default: Serial.println(currentStatus); break;
+      }
+      lastStatus = currentStatus;
+    } else {
+      Serial.print(".");
+    }
+    attempts++;
+
+    // Keep web server responsive
+    server.handleClient();
+
+    // Process DNS for captive portal
+    if (captivePortalActive) {
+      dnsServer.processNextRequest();
+    }
+  }
+
   if (WiFi.status() == WL_CONNECTED) {
-   wifiConnected = true;
-   Serial.println("\n✓ WiFi connected!");
-   Serial.print("Station IP: ");
-   Serial.println(WiFi.localIP());
-   Serial.print("AP still active at: ");
-   Serial.println(WiFi.softAPIP());
- } else {
-   wifiConnected = false;
-   Serial.println("\n✗ WiFi connection failed");
-   Serial.println("AP mode remains active for configuration");
-   Serial.print("AP IP: ");
-   Serial.println(WiFi.softAPIP());
- }
+    wifiConnected = true;
+    Serial.println("\n✓ WiFi connected!");
+    Serial.print("Station IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("AP still active at: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    wifiConnected = false;
+    Serial.println("\n✗ WiFi connection failed");
+    Serial.print("Final status: ");
+    switch (WiFi.status()) {
+      case WL_NO_SSID_AVAIL: Serial.println("Network not found - check SSID"); break;
+      case WL_CONNECT_FAILED: Serial.println("Connection failed - check password"); break;
+      default: Serial.println("Unknown error"); break;
+    }
+    Serial.println("AP mode remains active for configuration");
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+  Serial.println("===============================\n");
 }
 
 
@@ -1170,28 +1466,36 @@ void handleRoot() {
 
 
 void handleConfig() {
- DynamicJsonDocument doc(3072); // Increased for reminders and Pomodoro
- doc["valid"] = config.valid;
- doc["ssid"] = config.ssid;
- doc["password"] = config.password;
- doc["ntpServer"] = config.ntpServer;
- doc["gmtOffset_sec"] = config.gmtOffset_sec;
- doc["daylightOffset_sec"] = config.daylightOffset_sec;
- doc["weatherApiKey"] = config.weatherApiKey;
- doc["lat"] = config.lat;
- doc["lon"] = config.lon;
- doc["cityName"] = config.cityName;
- doc["brightness"] = config.brightness;
- doc["clockFormat24h"] = config.clockFormat24h;
-  // Add reminders array
- JsonArray reminders = doc.createNestedArray("reminders");
- for (int i = 0; i < 3; i++) {
-   JsonObject reminder = reminders.createNestedObject();
-   reminder["enabled"] = config.reminders[i].enabled;
-   reminder["hour"] = config.reminders[i].hour;
-   reminder["minute"] = config.reminders[i].minute;
-   reminder["message"] = config.reminders[i].message;
- }
+  DynamicJsonDocument doc(1024);  // Reduced - no reminders array needed
+  doc["valid"] = config.valid;
+  doc["ssid"] = config.ssid;
+  doc["password"] = config.password;
+  doc["ntpServer"] = config.ntpServer;
+  doc["gmtOffset_sec"] = config.gmtOffset_sec;
+  doc["daylightOffset_sec"] = config.daylightOffset_sec;
+  doc["weatherApiKey"] = config.weatherApiKey;
+  doc["lat"] = config.lat;
+  doc["lon"] = config.lon;
+  doc["cityName"] = config.cityName;
+  doc["brightness"] = config.brightness;
+  doc["clockFormat24h"] = config.clockFormat24h;
+
+  // Add break settings
+  doc["waterBreakEnabled"] = config.waterBreakEnabled;
+  doc["waterIntervalMins"] = config.waterIntervalMins;
+  doc["postureBreakEnabled"] = config.postureBreakEnabled;
+  doc["postureIntervalMins"] = config.postureIntervalMins;
+
+  // Add auto-weather setting
+  doc["autoWeatherEnabled"] = config.autoWeatherEnabled;
+
+  // Add auto-brightness settings
+  doc["autoBrightnessEnabled"] = config.autoBrightnessEnabled;
+  doc["dayBrightness"] = config.dayBrightness;
+  doc["nightBrightness"] = config.nightBrightness;
+  doc["nightStartHour"] = config.nightStartHour;
+  doc["nightEndHour"] = config.nightEndHour;
+
   // Add Pomodoro phases array
  JsonArray pomodoroPhases = doc.createNestedArray("pomodoroPhases");
  for (int i = 0; i < 4; i++) {
@@ -1206,30 +1510,51 @@ void handleConfig() {
 
 
 void handleSave() {
- // Store old WiFi credentials to check if they changed
- char oldSSID[32];
- char oldPassword[64];
- strncpy(oldSSID, config.ssid, sizeof(oldSSID));
- oldSSID[sizeof(oldSSID) - 1] = '\0';
- strncpy(oldPassword, config.password, sizeof(oldPassword));
- oldPassword[sizeof(oldPassword) - 1] = '\0';
+  Serial.println("\n=== Save Request Received ===");
+
+  // Store old WiFi credentials to check if they changed
+  char oldSSID[32];
+  char oldPassword[64];
+  strncpy(oldSSID, config.ssid, sizeof(oldSSID));
+  oldSSID[sizeof(oldSSID) - 1] = '\0';
+  strncpy(oldPassword, config.password, sizeof(oldPassword));
+  oldPassword[sizeof(oldPassword) - 1] = '\0';
+
   bool wifiChanged = false;
+
   if (server.hasArg("ssid")) {
-   String newSSID = server.arg("ssid");
-   if (strcmp(config.ssid, newSSID.c_str()) != 0) {
-     wifiChanged = true;
-   }
-   strncpy(config.ssid, newSSID.c_str(), sizeof(config.ssid) - 1);
-   config.ssid[sizeof(config.ssid) - 1] = '\0';
- }
+    String newSSID = server.arg("ssid");
+    Serial.print("Received SSID: '");
+    Serial.print(newSSID);
+    Serial.print("' (length: ");
+    Serial.print(newSSID.length());
+    Serial.println(")");
+    if (strcmp(config.ssid, newSSID.c_str()) != 0) {
+      wifiChanged = true;
+      Serial.println("  -> SSID changed!");
+    }
+    strncpy(config.ssid, newSSID.c_str(), sizeof(config.ssid) - 1);
+    config.ssid[sizeof(config.ssid) - 1] = '\0';
+  } else {
+    Serial.println("Warning: No SSID in request");
+  }
+
   if (server.hasArg("password")) {
-   String newPassword = server.arg("password");
-   if (strcmp(config.password, newPassword.c_str()) != 0) {
-     wifiChanged = true;
-   }
-   strncpy(config.password, newPassword.c_str(), sizeof(config.password) - 1);
-   config.password[sizeof(config.password) - 1] = '\0';
- }
+    String newPassword = server.arg("password");
+    Serial.print("Received password length: ");
+    Serial.println(newPassword.length());
+    if (strcmp(config.password, newPassword.c_str()) != 0) {
+      wifiChanged = true;
+      Serial.println("  -> Password changed!");
+    }
+    strncpy(config.password, newPassword.c_str(), sizeof(config.password) - 1);
+    config.password[sizeof(config.password) - 1] = '\0';
+  } else {
+    Serial.println("Warning: No password in request");
+  }
+
+  Serial.print("WiFi changed: ");
+  Serial.println(wifiChanged ? "YES" : "NO");
   if (server.hasArg("ntpServer")) {
    strncpy(config.ntpServer, server.arg("ntpServer").c_str(), sizeof(config.ntpServer) - 1);
    config.ntpServer[sizeof(config.ntpServer) - 1] = '\0';
@@ -1262,47 +1587,89 @@ void handleSave() {
    if (config.brightness > 15) config.brightness = 15;
    P.setIntensity(config.brightness);
  }
-  if (server.hasArg("clockFormat")) {
-   config.clockFormat24h = (server.arg("clockFormat") == "24");
- }
-  // Handle reminders (0-2)
- for (int i = 0; i < 3; i++) {
-   String enabledArg = "reminder" + String(i) + "Enabled";
-   String hourArg = "reminder" + String(i) + "Hour";
-   String minuteArg = "reminder" + String(i) + "Minute";
-   String messageArg = "reminder" + String(i) + "Message";
-  
-   config.reminders[i].enabled = server.hasArg(enabledArg);
-  
-   if (server.hasArg(hourArg)) {
-     config.reminders[i].hour = server.arg(hourArg).toInt();
-     if (config.reminders[i].hour < 0) config.reminders[i].hour = 0;
-     if (config.reminders[i].hour > 23) config.reminders[i].hour = 23;
-   }
-  
-   if (server.hasArg(minuteArg)) {
-     config.reminders[i].minute = server.arg(minuteArg).toInt();
-     if (config.reminders[i].minute < 0) config.reminders[i].minute = 0;
-     if (config.reminders[i].minute > 59) config.reminders[i].minute = 59;
-   }
-  
-   if (server.hasArg(messageArg)) {
-     String msg = server.arg(messageArg);
-     // Convert to uppercase before saving
-     msg.toUpperCase();
-     // Trim whitespace
-     msg.trim();
-     strncpy(config.reminders[i].message, msg.c_str(), sizeof(config.reminders[i].message) - 1);
-     config.reminders[i].message[sizeof(config.reminders[i].message) - 1] = '\0';
-    
-     Serial.print("Saved reminder ");
-     Serial.print(i);
-     Serial.print(" message: [");
-     Serial.print(config.reminders[i].message);
-     Serial.print("] Length: ");
-     Serial.println(strlen(config.reminders[i].message));
-   }
- }
+   if (server.hasArg("clockFormat")) {
+    config.clockFormat24h = (server.arg("clockFormat") == "24");
+  }
+
+  // Handle break settings
+  config.waterBreakEnabled = server.hasArg("waterBreakEnabled");
+  if (server.hasArg("waterInterval")) {
+    uint8_t val = server.arg("waterInterval").toInt();
+    if (val == 15 || val == 20 || val == 30) {
+      config.waterIntervalMins = val;
+    }
+  }
+
+  config.postureBreakEnabled = server.hasArg("postureBreakEnabled");
+  if (server.hasArg("postureInterval")) {
+    uint8_t val = server.arg("postureInterval").toInt();
+    if (val == 30 || val == 45 || val == 60) {
+      config.postureIntervalMins = val;
+    }
+  }
+
+  Serial.print("Break settings: Water=");
+  Serial.print(config.waterBreakEnabled ? "ON" : "OFF");
+  Serial.print(" (");
+  Serial.print(config.waterIntervalMins);
+  Serial.print("min), Posture=");
+  Serial.print(config.postureBreakEnabled ? "ON" : "OFF");
+  Serial.print(" (");
+  Serial.print(config.postureIntervalMins);
+  Serial.println("min)");
+
+  // Handle auto-weather setting
+  config.autoWeatherEnabled = server.hasArg("autoWeatherEnabled");
+  Serial.print("Auto-weather: ");
+  Serial.println(config.autoWeatherEnabled ? "ON" : "OFF");
+
+  // Handle auto-brightness settings
+  config.autoBrightnessEnabled = server.hasArg("autoBrightnessEnabled");
+  if (server.hasArg("dayBrightness")) {
+    uint8_t val = server.arg("dayBrightness").toInt();
+    if (val <= 15) {
+      config.dayBrightness = val;
+    }
+  }
+  if (server.hasArg("nightBrightness")) {
+    uint8_t val = server.arg("nightBrightness").toInt();
+    if (val <= 15) {
+      config.nightBrightness = val;
+    }
+  }
+  if (server.hasArg("nightStartHour")) {
+    uint8_t val = server.arg("nightStartHour").toInt();
+    if (val <= 23) {
+      config.nightStartHour = val;
+    }
+  }
+  if (server.hasArg("nightEndHour")) {
+    uint8_t val = server.arg("nightEndHour").toInt();
+    if (val <= 23) {
+      config.nightEndHour = val;
+    }
+  }
+
+  Serial.print("Auto-brightness: ");
+  Serial.print(config.autoBrightnessEnabled ? "ON" : "OFF");
+  Serial.print(" (Day=");
+  Serial.print(config.dayBrightness);
+  Serial.print(", Night=");
+  Serial.print(config.nightBrightness);
+  Serial.print(", ");
+  Serial.print(config.nightStartHour);
+  Serial.print(":00-");
+  Serial.print(config.nightEndHour);
+  Serial.println(":00)");
+
+  // Apply brightness change immediately if auto-brightness enabled
+  if (config.autoBrightnessEnabled) {
+    checkAutoBrightness();
+  } else {
+    // If auto-brightness disabled, apply manual brightness setting
+    P.setIntensity(config.brightness);
+  }
+
   // Handle Pomodoro phases (0-3)
  for (int i = 0; i < 4; i++) {
    String durationArg = "pomodoroPhase" + String(i) + "Duration";
@@ -1424,38 +1791,150 @@ void handleStatus() {
 }
 
 
+// --- CAPTIVE PORTAL HANDLERS ---
+
+void handleCaptivePortalRedirect() {
+  String redirectUrl = "http://192.168.4.1/";
+
+  Serial.print("[CAPTIVE] Redirecting ");
+  Serial.print(server.uri());
+  Serial.print(" to ");
+  Serial.println(redirectUrl);
+
+  server.sendHeader("Location", redirectUrl, true);
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  server.send(302, "text/plain", "");
+}
+
+void handleAndroidCaptive() {
+  Serial.println("[CAPTIVE] Android detection: /generate_204");
+  handleCaptivePortalRedirect();
+}
+
+void handleAppleCaptive() {
+  Serial.println("[CAPTIVE] Apple detection: /hotspot-detect.html");
+
+  // Apple expects HTML with redirect
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta http-equiv='refresh' content='0; url=http://192.168.4.1/'>";
+  html += "</head><body>";
+  html += "<a href='http://192.168.4.1/'>Configure Clock</a>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleWindowsCaptive() {
+  Serial.print("[CAPTIVE] Windows detection: ");
+  Serial.println(server.uri());
+  handleCaptivePortalRedirect();
+}
+
+void handleFirefoxCaptive() {
+  Serial.println("[CAPTIVE] Firefox detection: /success.txt");
+  handleCaptivePortalRedirect();
+}
+
+void handleNotFound() {
+  String uri = server.uri();
+  String host = server.hostHeader();
+
+  Serial.print("[CAPTIVE] NotFound: ");
+  Serial.print(uri);
+  Serial.print(" Host: ");
+  Serial.println(host);
+
+  // If request is not for our IP/hostname, redirect to config page
+  if (host != "192.168.4.1" &&
+      host != "deskmate.local" &&
+      host != WiFi.softAPIP().toString()) {
+    handleCaptivePortalRedirect();
+    return;
+  }
+
+  // For unknown paths, also redirect
+  handleCaptivePortalRedirect();
+}
+
+void startCaptivePortal() {
+  if (captivePortalActive) {
+    Serial.println("[DNS] Captive portal already active");
+    return;
+  }
+
+  Serial.println("[DNS] Starting captive portal DNS server...");
+
+  // Start DNS server - redirect all DNS queries to our AP IP
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  bool dnsStarted = dnsServer.start(DNS_PORT, "*", apIP);
+
+  if (dnsStarted) {
+    captivePortalActive = true;
+    Serial.println("[DNS] DNS server started on port 53");
+    Serial.println("[DNS] All DNS queries will resolve to 192.168.4.1");
+  } else {
+    Serial.println("[DNS] ERROR: DNS server failed to start!");
+  }
+
+  // Start mDNS for deskmate.local
+  if (MDNS.begin("deskmate")) {
+    mdnsStarted = true;
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("[mDNS] Started: http://deskmate.local");
+  } else {
+    Serial.println("[mDNS] Failed to start mDNS");
+  }
+}
+
+void stopCaptivePortal() {
+  if (captivePortalActive) {
+    dnsServer.stop();
+    captivePortalActive = false;
+    Serial.println("[DNS] Captive portal DNS server stopped");
+  }
+
+  if (mdnsStarted) {
+    MDNS.end();
+    mdnsStarted = false;
+    Serial.println("[mDNS] Stopped");
+  }
+}
+
+
 // --- CLOCK FUNCTIONS ---
 
 
 void handleButton() {
- bool currentState = (digitalRead(MODE_BUTTON_PIN) == LOW);
+  bool currentState = (digitalRead(MODE_BUTTON_PIN) == LOW);
   if (currentState && !buttonPressed) {
-   if (millis() - lastButtonPress > debounceDelay) {
-     lastButtonPress = millis();
-     buttonPressed = true;
-    
-     if (currentMode == MODE_CLOCK) {
-       Serial.println("Button pressed: Switching to weather");
-       startWeatherScroll();
-     } else if (currentMode == MODE_WEATHER) {
-       Serial.println("Button pressed: Switching to Pomodoro");
-       startPomodoroMode();
-     } else if (currentMode == MODE_POMODORO) {
-       Serial.println("Button pressed: Exiting Pomodoro, returning to clock");
-       currentMode = MODE_CLOCK;
-       P.displayClear();
-       colonVisible = true;
-       updateClockDisplay();
-     } else if (currentMode == MODE_REMINDER) {
-       // Button press during reminder - return to clock
-       Serial.println("Button pressed: Exiting reminder, returning to clock");
-       reminderScrollCount = REMINDER_SCROLL_LOOPS; // Force exit
-       currentMode = MODE_CLOCK;
-       P.displayClear();
-       colonVisible = true;
-       updateClockDisplay();
-     }
-   }
+    if (millis() - lastButtonPress > debounceDelay) {
+      lastButtonPress = millis();
+      buttonPressed = true;
+
+      // New cycling: Clock <-> Pomodoro only
+      // Weather/Break modes -> return to Clock
+      if (currentMode == MODE_CLOCK) {
+        Serial.println("Button: Clock -> Pomodoro");
+        startPomodoroMode();
+      } else if (currentMode == MODE_POMODORO) {
+        Serial.println("Button: Pomodoro -> Clock");
+        currentMode = MODE_CLOCK;
+        P.displayClear();
+        colonVisible = true;
+        updateClockDisplay();
+      } else if (currentMode == MODE_WEATHER || currentMode == MODE_BREAK) {
+        // Exit auto-weather or break, return to clock
+        Serial.println("Button: Weather/Break -> Clock");
+        autoWeatherActive = false;
+        breakActive = false;
+        currentMode = MODE_CLOCK;
+        P.displayClear();
+        colonVisible = true;
+        updateClockDisplay();
+      }
+    }
   }
   if (!currentState) {
    buttonPressed = false;
@@ -1556,77 +2035,155 @@ void startWeatherScroll() {
    Serial.print("Weather scroll: ");
    Serial.println(weatherData);
  }
-  // Slower, smoother scroll speed (100-120 is good for readability)
- P.displayZoneText(0, displayText, PA_LEFT, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
- P.displayAnimate();
+   // Slower, smoother scroll speed (100-120 is good for readability)
+  // Use correct scroll direction based on flip state
+  textEffect_t scrollDir = getScrollEffect();
+  P.displayZoneText(0, displayText, PA_LEFT, 100, 0, scrollDir, scrollDir);
+  P.displayAnimate();
 }
 
 
-void showReminder(const char* message) {
- currentMode = MODE_REMINDER;
- reminderScrollCount = 0; // Reset counter
- P.displayClear();
-  // Ensure message is valid and not empty
- if (message == NULL || strlen(message) == 0) {
-   Serial.println("Error: Empty reminder message");
-   return;
- }
-  Serial.print("Raw reminder message received: [");
- Serial.print(message);
- Serial.print("] Length: ");
- Serial.println(strlen(message));
-  // Format reminder message with smooth scroll
- memset(reminderDisplayText, 0, sizeof(reminderDisplayText)); // Clear buffer
-  // Copy message and convert to uppercase
- int srcIdx = 0;
- int dstIdx = 0;
- int maxLen = sizeof(reminderDisplayText) - 10; // Leave room for trailing spaces
-  while (message[srcIdx] != '\0' && dstIdx < maxLen) {
-   char c = message[srcIdx];
-   // Convert to uppercase
-   if (c >= 'a' && c <= 'z') {
-     c = c - 32;
-   }
-   // Only copy printable ASCII characters (32-126) and common punctuation
-   if ((c >= 32 && c <= 126) || c == '\0') {
-     reminderDisplayText[dstIdx] = c;
-     dstIdx++;
-   }
-   srcIdx++;
- }
- reminderDisplayText[dstIdx] = '\0';
-  // Ensure string is properly terminated
- if (dstIdx == 0) {
-   Serial.println("Error: No valid characters in reminder message");
-   return;
- }
-  // Add trailing spaces for scroll effect (enough to scroll completely)
- int currentLen = strlen(reminderDisplayText);
- int spacesToAdd = 32; // Add spaces to ensure full scroll
- int availableSpace = sizeof(reminderDisplayText) - currentLen - 1;
- int spacesAdded = (spacesToAdd < availableSpace) ? spacesToAdd : availableSpace;
-  for (int j = 0; j < spacesAdded; j++) {
-   reminderDisplayText[currentLen + j] = ' ';
- }
- reminderDisplayText[currentLen + spacesAdded] = '\0';
-  Serial.print("Formatted reminder: [");
- Serial.print(reminderDisplayText);
- Serial.print("] Length: ");
- Serial.println(strlen(reminderDisplayText));
-  // Ensure display is ready
- delay(50);
+// --- AUTO-WEATHER FUNCTION ---
+void startAutoWeather() {
+  if (currentMode != MODE_CLOCK) return;  // Only from clock mode
+
+  previousMode = MODE_CLOCK;
+  currentMode = MODE_WEATHER;
+  autoWeatherActive = true;
+  flipWeatherActive = false;
+  weatherDisplayStart = millis();
+
+  Serial.println("[AUTO-WEATHER] Starting 10-second weather display");
+  startWeatherScroll();
+}
+
+
+// --- FLIP-TRIGGERED WEATHER (15 seconds) ---
+void startFlipWeather() {
+  if (currentMode != MODE_CLOCK) return;  // Only from clock mode
+
+  previousMode = MODE_CLOCK;
+  currentMode = MODE_WEATHER;
+  flipWeatherActive = true;
+  autoWeatherActive = false;
+  weatherDisplayStart = millis();
+
+  Serial.println("[FLIP-WEATHER] Starting 15-second weather display");
+  startWeatherScroll();
+}
+
+
+// --- AUTO-BRIGHTNESS FUNCTION ---
+void checkAutoBrightness() {
+  if (!config.autoBrightnessEnabled) return;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int currentHour = timeinfo.tm_hour;
+  bool isNight = false;
+
+  // Handle night time calculation (night can span midnight)
+  if (config.nightStartHour > config.nightEndHour) {
+    // Night spans midnight (e.g., 20:00 to 06:00)
+    isNight = (currentHour >= config.nightStartHour || currentHour < config.nightEndHour);
+  } else {
+    // Night doesn't span midnight (e.g., 22:00 to 05:00 wouldn't work, but handle anyway)
+    isNight = (currentHour >= config.nightStartHour && currentHour < config.nightEndHour);
+  }
+
+  // Apply appropriate brightness
+  static bool wasNight = false;
+  static bool firstCheck = true;
+
+  if (firstCheck || isNight != wasNight) {
+    uint8_t targetBrightness = isNight ? config.nightBrightness : config.dayBrightness;
+    P.setIntensity(targetBrightness);
+
+    Serial.print("[AUTO-BRIGHTNESS] ");
+    Serial.print(isNight ? "Night" : "Day");
+    Serial.print(" mode - brightness set to ");
+    Serial.println(targetBrightness);
+
+    wasNight = isNight;
+    firstCheck = false;
+  }
+}
+
+
+// --- BREAK HANDLING (shared for water/posture) ---
+void handleBreak(BreakType type) {
+  // Only trigger breaks in clock mode
+  if (currentMode != MODE_CLOCK) return;
+
+  activeBreakType = type;
+  breakActive = true;
+  breakDisplayStart = millis();
+  previousMode = MODE_CLOCK;
+  currentMode = MODE_BREAK;
+
+  P.displayClear();
+
+  // Set message based on break type
+  if (type == WATER_BREAK) {
+    strcpy(breakDisplayText, "TIME FOR WATER!    ");
+    lastWaterBreak = millis();
+    Serial.println("[BREAK] Water break triggered");
+  } else {
+    strcpy(breakDisplayText, "CHECK YOUR POSTURE!    ");
+    lastPostureBreak = millis();
+    Serial.println("[BREAK] Posture break triggered");
+  }
+
   // Apply flip effect if needed
- if (displayFlipped) {
-   P.setZoneEffect(0, true, PA_FLIP_LR);  // Enable horizontal flip
-   P.setZoneEffect(0, true, PA_FLIP_UD);   // Enable vertical flip
- } else {
-   P.setZoneEffect(0, false, PA_FLIP_LR);  // Disable horizontal flip
-   P.setZoneEffect(0, false, PA_FLIP_UD);   // Disable vertical flip
- }
-  // Display with scroll animation (slower speed for readability)
- P.displayZoneText(0, reminderDisplayText, PA_LEFT, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
- P.displayAnimate();
-  Serial.println("Reminder display started");
+  if (displayFlipped) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  } else {
+    P.setZoneEffect(0, false, PA_FLIP_LR);
+    P.setZoneEffect(0, false, PA_FLIP_UD);
+  }
+
+  // Start scrolling display with correct direction based on flip state
+  textEffect_t scrollDir = getScrollEffect();
+  P.displayZoneText(0, breakDisplayText, PA_LEFT, 80, 0, scrollDir, scrollDir);
+  P.displayAnimate();
+}
+
+
+void checkBreaks() {
+  // Only check breaks in clock mode
+  if (currentMode != MODE_CLOCK) return;
+
+  unsigned long now = millis();
+
+  // Check water break (higher priority - check first)
+  if (config.waterBreakEnabled && config.waterIntervalMins > 0) {
+    uint32_t intervalMs = (uint32_t)config.waterIntervalMins * 60000UL;
+    if (now - lastWaterBreak >= intervalMs) {
+      handleBreak(WATER_BREAK);
+      return;  // Only one break at a time
+    }
+  }
+
+  // Check posture break
+  if (config.postureBreakEnabled && config.postureIntervalMins > 0) {
+    uint32_t intervalMs = (uint32_t)config.postureIntervalMins * 60000UL;
+    if (now - lastPostureBreak >= intervalMs) {
+      handleBreak(POSTURE_BREAK);
+      return;
+    }
+  }
+}
+
+
+void dismissBreak() {
+  if (!breakActive) return;
+
+  Serial.println("[BREAK] Dismissed");
+  breakActive = false;
+  currentMode = MODE_CLOCK;
+  P.displayClear();
+  colonVisible = true;
+  updateClockDisplay();
 }
 
 
@@ -1753,106 +2310,155 @@ void getWeather() {
 
 
 void startPomodoroMode() {
- Serial.println("Starting Pomodoro mode");
- currentMode = MODE_POMODORO;
- currentPomodoroPhase = -1; // Will be set to 0 by advancePomodoroPhase
- pomodoroPaused = false;
- pomodoroTimerExpired = false;
- pomodoroBlinkState = false;
- deviceLifted = false;
- flipDetected = false;
- 
- // Start first phase (advancePomodoroPhase will increment to 0)
- advancePomodoroPhase();
+  Serial.println("Starting Pomodoro mode");
+  currentMode = MODE_POMODORO;
+  currentPomodoroPhase = -1; // Will be set to 0 by advancePomodoroPhase
+  pomodoroPaused = false;
+  pomodoroTimerExpired = false;
+  pomodoroBlinkState = false;
+  deviceLifted = false;
+  flipDetected = false;
+
+  // Show "POMODORO" text first so user knows they're in Pomodoro mode
+  P.displayClear();
+
+  // Apply flip effect if needed
+  if (displayFlipped) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  } else {
+    P.setZoneEffect(0, false, PA_FLIP_LR);
+    P.setZoneEffect(0, false, PA_FLIP_UD);
+  }
+
+  P.displayZoneText(0, "POMODORO", PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
+  P.displayAnimate();
+  Serial.println("Showing POMODORO text...");
+
+  // Keep display for 1.5 seconds, but keep server responsive
+  unsigned long showStart = millis();
+  while (millis() - showStart < 1500) {
+    server.handleClient();
+    if (captivePortalActive) {
+      dnsServer.processNextRequest();
+    }
+    delay(10);
+  }
+
+  // Start first phase (advancePomodoroPhase will increment to 0)
+  advancePomodoroPhase();
 }
 
 
 void advancePomodoroPhase() {
- // Stop current phase and move to next
- Serial.print("Advancing Pomodoro phase from ");
- Serial.print(currentPomodoroPhase);
- 
- // Move to next phase (cycle)
- currentPomodoroPhase = (currentPomodoroPhase + 1) % 4;
- 
- Serial.print(" to ");
- Serial.println(currentPomodoroPhase);
- 
- // Get phase duration
- int durationMinutes = config.pomodoroPhases[currentPomodoroPhase].durationMinutes;
- pomodoroRemainingSeconds = durationMinutes * 60;
- pomodoroStartTime = millis();
- pomodoroPaused = false;
- pomodoroTimerExpired = false;
- pomodoroBlinkState = false;
- 
- Serial.print("Phase: ");
- Serial.print(config.pomodoroPhases[currentPomodoroPhase].name);
- Serial.print(" (");
- Serial.print(durationMinutes);
- Serial.println(" minutes)");
- 
- // Update display immediately
- updatePomodoroDisplay();
+  // Stop current phase and move to next
+  Serial.print("Advancing Pomodoro phase from ");
+  Serial.print(currentPomodoroPhase);
+
+  // Move to next phase (cycle)
+  currentPomodoroPhase = (currentPomodoroPhase + 1) % 4;
+
+  Serial.print(" to ");
+  Serial.println(currentPomodoroPhase);
+
+  // Get phase duration
+  int durationMinutes = config.pomodoroPhases[currentPomodoroPhase].durationMinutes;
+  pomodoroRemainingSeconds = durationMinutes * 60;
+  pomodoroStartTime = millis();
+  pomodoroPaused = false;
+  pomodoroTimerExpired = false;
+  pomodoroBlinkState = true;  // Start with display ON
+
+  // Start phase start blink animation (3 blinks)
+  phaseStartBlinking = true;
+  phaseStartBlinkCount = 0;
+  phaseStartBlinkTime = millis();
+
+  Serial.print("Phase: ");
+  Serial.print(config.pomodoroPhases[currentPomodoroPhase].name);
+  Serial.print(" (");
+  Serial.print(durationMinutes);
+  Serial.println(" minutes)");
+  Serial.println("Starting 3-blink animation...");
+
+  // Update display immediately (will show timer, then blink animation runs in loop)
+  updatePomodoroDisplay();
 }
 
 
 void updatePomodoroDisplay() {
- static char timerText[10];
- 
- // If timer expired, blink display
- if (pomodoroTimerExpired) {
-   unsigned long currentMillis = millis();
-   if (currentMillis - lastPomodoroBlink >= POMODORO_BLINK_INTERVAL) {
-     lastPomodoroBlink = currentMillis;
-     pomodoroBlinkState = !pomodoroBlinkState;
-   }
-   
-   if (!pomodoroBlinkState) {
-     // Blank during blink
-     P.displayClear();
-     return;
-   }
- }
- 
- // If paused, blink current time
- if (pomodoroPaused) {
-   unsigned long currentMillis = millis();
-   if (currentMillis - lastPomodoroBlink >= POMODORO_BLINK_INTERVAL) {
-     lastPomodoroBlink = currentMillis;
-     pomodoroBlinkState = !pomodoroBlinkState;
-   }
-   
-   if (!pomodoroBlinkState) {
-     P.displayClear();
-     return;
-   }
- }
- 
- // Calculate minutes and seconds
- int minutes = pomodoroRemainingSeconds / 60;
- int seconds = pomodoroRemainingSeconds % 60;
- 
- // Format as MM:SS (ensure colon is visible)
- snprintf(timerText, sizeof(timerText), "%02d:%02d", minutes, seconds);
- 
- // Ensure colon character is properly defined for display
- P.addChar(':', colonOn);
- 
- // Apply flip effect if needed
- if (displayFlipped) {
-   P.setZoneEffect(0, true, PA_FLIP_LR);
-   P.setZoneEffect(0, true, PA_FLIP_UD);
- } else {
-   P.setZoneEffect(0, false, PA_FLIP_LR);
-   P.setZoneEffect(0, false, PA_FLIP_UD);
- }
- 
- // Display centered
- P.displayZoneText(0, timerText, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
- 
- // Optional: Add phase indicator (e.g., "1" for phase 1)
- // For now, just show timer
+  static char timerText[10];
+  unsigned long currentMillis = millis();
+
+  // Phase start blink animation (3 blinks = 6 toggles)
+  if (phaseStartBlinking) {
+    if (currentMillis - phaseStartBlinkTime >= 300) {  // 300ms per toggle (faster blink)
+      phaseStartBlinkTime = currentMillis;
+      phaseStartBlinkCount++;
+      pomodoroBlinkState = !pomodoroBlinkState;
+
+      if (phaseStartBlinkCount >= PHASE_START_BLINK_TOTAL) {
+        // Animation complete
+        phaseStartBlinking = false;
+        pomodoroBlinkState = true;  // End with display ON
+        Serial.println("Phase start blink animation complete");
+      }
+    }
+
+    if (!pomodoroBlinkState) {
+      P.displayClear();
+      return;
+    }
+  }
+
+  // If timer expired, blink display
+  if (pomodoroTimerExpired) {
+    if (currentMillis - lastPomodoroBlink >= POMODORO_BLINK_INTERVAL) {
+      lastPomodoroBlink = currentMillis;
+      pomodoroBlinkState = !pomodoroBlinkState;
+    }
+
+    if (!pomodoroBlinkState) {
+      // Blank during blink
+      P.displayClear();
+      return;
+    }
+  }
+
+  // If paused, blink current time
+  if (pomodoroPaused) {
+    if (currentMillis - lastPomodoroBlink >= POMODORO_BLINK_INTERVAL) {
+      lastPomodoroBlink = currentMillis;
+      pomodoroBlinkState = !pomodoroBlinkState;
+    }
+
+    if (!pomodoroBlinkState) {
+      P.displayClear();
+      return;
+    }
+  }
+
+  // Calculate minutes and seconds
+  int minutes = pomodoroRemainingSeconds / 60;
+  int seconds = pomodoroRemainingSeconds % 60;
+
+  // Format as MM:SS (ensure colon is visible)
+  snprintf(timerText, sizeof(timerText), "%02d:%02d", minutes, seconds);
+
+  // Ensure colon character is properly defined for display
+  P.addChar(':', colonOn);
+
+  // Apply flip effect if needed
+  if (displayFlipped) {
+    P.setZoneEffect(0, true, PA_FLIP_LR);
+    P.setZoneEffect(0, true, PA_FLIP_UD);
+  } else {
+    P.setZoneEffect(0, false, PA_FLIP_LR);
+    P.setZoneEffect(0, false, PA_FLIP_UD);
+  }
+
+  // Display centered
+  P.displayZoneText(0, timerText, PA_CENTER, 0, 0, PA_PRINT, PA_NO_EFFECT);
 }
 
 
@@ -1876,296 +2482,195 @@ void resumePomodoro() {
 }
 
 
+// ============================================================================
+// POMODORO GESTURE DETECTION (Flip & Lift)
+// ============================================================================
+// Key distinction:
+// - FLIP: Device rotates 180° while staying on surface. Magnitude stays ~16384 (1g).
+// - LIFT: Device is picked up. Magnitude changes during hand movement.
+// ============================================================================
+
+void readPomodoroAccel() {
+  g_accelX = readMPU6050Accel(MPU6050_ACCEL_XOUT_H);
+  g_accelY = readMPU6050Accel(MPU6050_ACCEL_YOUT_H);
+  g_accelZ = readMPU6050Accel(MPU6050_ACCEL_ZOUT_H);
+  g_magnitude = sqrt((float)g_accelX * g_accelX +
+                     (float)g_accelY * g_accelY +
+                     (float)g_accelZ * g_accelZ);
+  g_sensorRead = true;
+}
+
+
 void checkPomodoroLift() {
- if (!checkMPU6050()) {
-   return; // MPU6050 not available
- }
- 
- // Read all axes to detect lift
- int16_t accelX = readMPU6050Accel(MPU6050_ACCEL_XOUT_H);
- int16_t accelY = readMPU6050Accel(MPU6050_ACCEL_YOUT_H);
- int16_t accelZ = readMPU6050Accel(MPU6050_ACCEL_ZOUT_H);
- 
- // Find which axis is vertical (has largest magnitude)
- int16_t absX = abs(accelX);
- int16_t absY = abs(accelY);
- int16_t absZ = abs(accelZ);
- 
- int16_t maxAxis = max(absX, max(absY, absZ));
- 
- // Calculate total magnitude
- float magnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
- 
- // Use relative change detection instead of absolute thresholds
- // Track baseline values when device is stable on desk
- static float baselineMagnitude = 0.0;
- static int16_t baselineMaxAxis = 0;
- static unsigned long baselineUpdateTime = 0;
- static bool baselineEstablished = false;
- static bool baselineFrozen = false; // Freeze baseline when device is lifted
- 
- // Determine current lift state
- static bool currentlyLifted = false;
- static bool currentlyOnDesk = false;
- 
- // First, determine current state using previous baseline (or absolute thresholds)
- if (baselineEstablished && !baselineFrozen) {
-   float magnitudeRatio = magnitude / baselineMagnitude;
-   float axisRatio = (float)maxAxis / (float)baselineMaxAxis;
-   
-   // More sensitive thresholds: lifted if below 85% of baseline
-   currentlyLifted = (magnitudeRatio < 0.85) || (axisRatio < 0.85);
-   currentlyOnDesk = (magnitudeRatio > 0.90) && (axisRatio > 0.90); // Must be 90%+ of baseline
- } else if (baselineEstablished && baselineFrozen) {
-   // When baseline is frozen, use it to detect state
-   float magnitudeRatio = magnitude / baselineMagnitude;
-   float axisRatio = (float)maxAxis / (float)baselineMaxAxis;
-   
-   currentlyLifted = (magnitudeRatio < 0.85) || (axisRatio < 0.85);
-   currentlyOnDesk = (magnitudeRatio > 0.90) && (axisRatio > 0.90);
- } else {
-   // Fallback to absolute thresholds if baseline not established
-   const int16_t onDeskAxisMin = 12000;
-   const int16_t liftedAxisMax = 8000;
-   const float onDeskMagnitudeMin = 14000.0;
-   const float liftedMagnitudeMax = 10000.0;
-   
-   currentlyLifted = (maxAxis < liftedAxisMax) || (magnitude < liftedMagnitudeMax);
-   currentlyOnDesk = (maxAxis > onDeskAxisMin) && (magnitude > onDeskMagnitudeMin);
- }
- 
- // Update baseline only when device is stable on desk (every 2 seconds)
- // AND baseline is not frozen (device not lifted)
- // Use absolute thresholds to determine if device is on desk (not relative to baseline)
- bool isOnDeskByAbsolute = (magnitude > 14000 && magnitude < 18000 && maxAxis > 12000 && maxAxis < 18000);
- 
- if (!baselineFrozen && millis() - baselineUpdateTime > 2000) {
-   // If magnitude and axis are in expected "on desk" range, update baseline
-   if (isOnDeskByAbsolute) {
-     if (!baselineEstablished) {
-       baselineMagnitude = magnitude;
-       baselineMaxAxis = maxAxis;
-       baselineEstablished = true;
-       Serial.print("[LIFT] Baseline established: Magnitude=");
-       Serial.print(baselineMagnitude);
-       Serial.print(", MaxAxis=");
-       Serial.println(baselineMaxAxis);
-     } else {
-       // Smooth baseline update (moving average) when device appears to be on desk
-       baselineMagnitude = (baselineMagnitude * 0.95) + (magnitude * 0.05);
-       baselineMaxAxis = (baselineMaxAxis * 0.95) + (maxAxis * 0.05);
-     }
-   }
-   baselineUpdateTime = millis();
- }
- 
- // Freeze/unfreeze baseline based on lift state
- if (currentlyLifted && !baselineFrozen) {
-   baselineFrozen = true;
-   Serial.println("[LIFT] Baseline frozen (device lifted)");
- } else if (currentlyOnDesk && baselineFrozen) {
-   baselineFrozen = false;
-   Serial.println("[LIFT] Baseline unfrozen (device on desk)");
- }
- 
- // Debug output for lift detection (every 500ms)
- static unsigned long lastLiftDebugTime = 0;
- if (millis() - lastLiftDebugTime > 500) {
-   Serial.print("[LIFT DEBUG] Magnitude: ");
-   Serial.print(magnitude);
-   Serial.print(", MaxAxis: ");
-   Serial.print(maxAxis);
-   if (baselineEstablished) {
-     Serial.print(" | Baseline: M=");
-     Serial.print(baselineMagnitude);
-     Serial.print(", A=");
-     Serial.print(baselineMaxAxis);
-     Serial.print(" | Ratio: M=");
-     Serial.print(magnitude / baselineMagnitude, 2);
-     Serial.print(", A=");
-     Serial.print((float)maxAxis / (float)baselineMaxAxis, 2);
-   }
-   Serial.print(" | Lifted: ");
-   Serial.print(currentlyLifted ? "YES" : "NO");
-   Serial.print(", OnDesk: ");
-   Serial.print(currentlyOnDesk ? "YES" : "NO");
-   Serial.print(" | Paused: ");
-   Serial.println(pomodoroPaused ? "YES" : "NO");
-   lastLiftDebugTime = millis();
- }
- 
- // State machine for lift detection (separate from baseline state machine above)
- static bool lastLiftState = false;
- static unsigned long liftStartTime = 0;
- static bool liftActionTaken = false; // Track if we've taken action for this lift cycle
- static unsigned long lastPutBackTime = 0;
- 
- // Detect state transitions
- if (currentlyLifted != lastLiftState) {
-   // State changed
-   if (currentlyLifted) {
-     // Just lifted
-     liftStartTime = millis();
-     liftActionTaken = false;
-     Serial.print("[POMODORO] Device lifted detected (magnitude: ");
-     Serial.print(magnitude);
-     Serial.print(", max axis: ");
-     Serial.print(maxAxis);
-     if (baselineEstablished) {
-       Serial.print(", ratio: ");
-       Serial.print(magnitude / baselineMagnitude, 2);
-     }
-     Serial.println(")");
-   } else if (currentlyOnDesk && lastLiftState) {
-     // Just put back down - only act if it was actually lifted before
-     unsigned long liftDuration = millis() - liftStartTime;
-     unsigned long timeSinceLastPutBack = millis() - lastPutBackTime;
-     
-     Serial.print("[POMODORO] Device put back (lift duration: ");
-     Serial.print(liftDuration);
-     Serial.print("ms, time since last: ");
-     Serial.print(timeSinceLastPutBack);
-     Serial.print("ms, action taken: ");
-     Serial.print(liftActionTaken ? "YES" : "NO");
-     Serial.println(")");
-     
-     // Require minimum lift duration (reduced to 300ms for better responsiveness)
-     // and minimum time since last put-back to prevent double-triggers
-     if (liftDuration >= 300 && timeSinceLastPutBack >= 500 && !liftActionTaken) {
-       // Device was lifted and put back - toggle pause/resume
-       liftActionTaken = true;
-       lastPutBackTime = millis();
-       
-       if (pomodoroPaused) {
-         resumePomodoro();
-         Serial.println("[POMODORO] Device put back - timer RESUMED");
-       } else {
-         pausePomodoro();
-         Serial.println("[POMODORO] Device put back - timer PAUSED");
-       }
-     } else {
-       Serial.print("[POMODORO] Put-back ignored: ");
-       if (liftDuration < 300) Serial.print("lift too short ("); Serial.print(liftDuration); Serial.print("ms) ");
-       if (timeSinceLastPutBack < 500) Serial.print("too soon since last ("); Serial.print(timeSinceLastPutBack); Serial.print("ms) ");
-       if (liftActionTaken) Serial.print("action already taken ");
-       Serial.println();
-     }
-   }
-   lastLiftState = currentlyLifted;
- }
- 
- lastAccelY = accelY;
+  if (!checkMPU6050()) return;
+  if (!g_sensorRead) readPomodoroAccel();
+
+  // === LIFT DETECTION CONSTANTS ===
+  const float MAGNITUDE_1G = 16384.0;       // Expected magnitude at rest (1g)
+  const float LIFT_THRESHOLD = 0.70;         // Magnitude drops below 70% = lifted
+  const float ON_DESK_THRESHOLD = 0.92;      // Magnitude above 92% = on desk
+  const uint32_t MIN_LIFT_DURATION_MS = 400; // Must be lifted for 400ms+
+  const uint32_t DEBOUNCE_MS = 800;          // Minimum time between pause/resume
+
+  // State machine
+  static enum { DESK, LIFTING, LIFTED, PUTTING_BACK } liftState = DESK;
+  static unsigned long stateChangeTime = 0;
+  static unsigned long lastActionTime = 0;
+  static float smoothedMagnitude = MAGNITUDE_1G;
+
+  // Smooth the magnitude to reduce noise (exponential moving average)
+  smoothedMagnitude = smoothedMagnitude * 0.7 + g_magnitude * 0.3;
+  float ratio = smoothedMagnitude / MAGNITUDE_1G;
+
+  // Determine current physical state
+  bool isLiftedNow = (ratio < LIFT_THRESHOLD);
+  bool isOnDeskNow = (ratio > ON_DESK_THRESHOLD);
+
+  unsigned long now = millis();
+
+  switch (liftState) {
+    case DESK:
+      if (isLiftedNow) {
+        liftState = LIFTING;
+        stateChangeTime = now;
+        Serial.println("[LIFT] Possible lift detected...");
+      }
+      break;
+
+    case LIFTING:
+      if (isOnDeskNow) {
+        // False alarm - device wasn't actually lifted
+        liftState = DESK;
+        Serial.println("[LIFT] False alarm - back to desk");
+      } else if (isLiftedNow && (now - stateChangeTime >= MIN_LIFT_DURATION_MS)) {
+        // Confirmed lift!
+        liftState = LIFTED;
+        Serial.print("[LIFT] LIFTED confirmed (magnitude ratio: ");
+        Serial.print(ratio, 2);
+        Serial.println(")");
+      }
+      break;
+
+    case LIFTED:
+      if (isOnDeskNow) {
+        liftState = PUTTING_BACK;
+        stateChangeTime = now;
+        Serial.println("[LIFT] Device being put back...");
+      }
+      break;
+
+    case PUTTING_BACK:
+      if (isLiftedNow) {
+        // Picked up again before settling
+        liftState = LIFTED;
+        Serial.println("[LIFT] Picked up again");
+      } else if (isOnDeskNow && (now - stateChangeTime >= 200)) {
+        // Device is back on desk - trigger pause/resume
+        liftState = DESK;
+
+        if (now - lastActionTime >= DEBOUNCE_MS) {
+          lastActionTime = now;
+          if (pomodoroPaused) {
+            resumePomodoro();
+            Serial.println("[LIFT] >>> TIMER RESUMED <<<");
+          } else {
+            pausePomodoro();
+            Serial.println("[LIFT] >>> TIMER PAUSED <<<");
+          }
+        } else {
+          Serial.println("[LIFT] Debounce - action skipped");
+        }
+      }
+      break;
+  }
 }
 
 
 void checkPomodoroFlip() {
- if (!checkMPU6050()) {
-   return; // MPU6050 not available
- }
- 
- // Read all three axes
- int16_t accelX = readMPU6050Accel(MPU6050_ACCEL_XOUT_H);
- int16_t accelY = readMPU6050Accel(MPU6050_ACCEL_YOUT_H);
- int16_t accelZ = readMPU6050Accel(MPU6050_ACCEL_ZOUT_H);
- 
- // Find which axis is vertical (has largest magnitude)
- // This works regardless of how MPU6050 is mounted
- int16_t absX = abs(accelX);
- int16_t absY = abs(accelY);
- int16_t absZ = abs(accelZ);
- 
- int16_t maxAxis = max(absX, max(absY, absZ));
- 
- // Determine which axis is vertical and get its value
- int16_t verticalAxis = 0;
- if (maxAxis == absX) {
-   verticalAxis = accelX;
- } else if (maxAxis == absY) {
-   verticalAxis = accelY;
- } else {
-   verticalAxis = accelZ;
- }
- 
- // For 180° flip: vertical axis sign changes
- // Normal: vertical axis positive and large
- // Flipped: vertical axis negative and large
- const int16_t minVerticalMagnitude = 8000; // Minimum for stable reading
- 
- if (maxAxis < minVerticalMagnitude) {
-   return; // Not stable enough
- }
- 
- // Check if other axes are small (device not tilted)
- int16_t otherAxesMax = 0;
- if (maxAxis == absX) {
-   otherAxesMax = max(absY, absZ);
- } else if (maxAxis == absY) {
-   otherAxesMax = max(absX, absZ);
- } else {
-   otherAxesMax = max(absX, absY);
- }
- 
- // Require other axes to be relatively small (prevents side tilts)
- if (otherAxesMax > 8000) {
-   return; // Device is tilted sideways
- }
- 
- // Determine orientation based on vertical axis sign
- bool isFlipped180 = (verticalAxis < -minVerticalMagnitude);
- bool isNormal = (verticalAxis > minVerticalMagnitude);
- 
- // Track state changes for flip detection
- static int16_t lastVerticalAxis = 0;
- static bool lastWasFlipped = false;
- static unsigned long lastFlipTime = 0;
- static bool phaseAdvancePending = false; // Track if we need to advance phase
- 
- // Detect ANY flip transition: normal -> flipped OR flipped -> normal
- // Both should advance the phase
- bool orientationChanged = false;
- 
- if (isFlipped180 && !lastWasFlipped && lastVerticalAxis > minVerticalMagnitude) {
-   // Just flipped from normal to flipped
-   orientationChanged = true;
-   lastWasFlipped = true;
- } else if (isNormal && lastWasFlipped && lastVerticalAxis < -minVerticalMagnitude) {
-   // Just returned from flipped to normal - this is also a flip!
-   orientationChanged = true;
-   lastWasFlipped = false;
- } else if (isFlipped180) {
-   lastWasFlipped = true;
- } else if (isNormal) {
-   lastWasFlipped = false;
- }
- 
- // If orientation changed, advance phase (with debounce)
- if (orientationChanged) {
-   unsigned long timeSinceLastFlip = millis() - lastFlipTime;
-   
-   // Prevent rapid double-flips (minimum 800ms between phase changes)
-   if (timeSinceLastFlip > 800) {
-     Serial.print("[POMODORO] 180° flip detected (axis: ");
-     Serial.print(verticalAxis);
-     Serial.print(" -> ");
-     Serial.print(lastVerticalAxis);
-     Serial.print(", state: ");
-     Serial.print(isFlipped180 ? "FLIPPED" : "NORMAL");
-     Serial.println("), advancing phase");
-     
-     advancePomodoroPhase();
-     lastFlipTime = millis();
-     flipDetected = false; // Reset flip detection flag
-   }
- }
- 
- // Update display orientation based on current state (for display flip)
- displayFlipped = isFlipped180;
- 
- // Store current state for next check
- if (isNormal || isFlipped180) {
-   lastVerticalAxis = verticalAxis;
- }
- lastAccelZ = accelZ;
+  if (!checkMPU6050()) return;
+  if (!g_sensorRead) readPomodoroAccel();
+
+  // === FLIP DETECTION CONSTANTS ===
+  const float MAGNITUDE_1G = 16384.0;
+  const float STABLE_MIN = 0.85;             // Magnitude must be >85% of 1g
+  const float STABLE_MAX = 1.15;             // Magnitude must be <115% of 1g
+  const int16_t VERTICAL_THRESHOLD = 10000;  // Strong vertical component required
+  const int16_t TILT_MAX = 6000;             // Other axes must be small
+  const uint32_t FLIP_DEBOUNCE_MS = 1000;    // 1 second between flips
+
+  // State tracking
+  static int8_t lastOrientation = 0;  // -1 = flipped, 0 = unknown, 1 = normal
+  static unsigned long lastFlipTime = 0;
+  static bool flipLocked = false;     // Lock during lift to prevent false flips
+
+  // Check if magnitude is stable (device on surface, not being lifted)
+  float ratio = g_magnitude / MAGNITUDE_1G;
+  bool isStable = (ratio >= STABLE_MIN && ratio <= STABLE_MAX);
+
+  // During a lift, don't detect flips
+  if (!isStable) {
+    flipLocked = true;
+    return;
+  }
+
+  // Unlock after returning to stable (with small delay)
+  if (flipLocked && isStable) {
+    static unsigned long stableStartTime = 0;
+    if (stableStartTime == 0) stableStartTime = millis();
+    if (millis() - stableStartTime < 300) return;  // Wait 300ms stable
+    flipLocked = false;
+    stableStartTime = 0;
+  }
+
+  // Find the dominant (vertical) axis
+  int16_t absX = abs(g_accelX);
+  int16_t absY = abs(g_accelY);
+  int16_t absZ = abs(g_accelZ);
+
+  int16_t verticalValue = 0;
+  int16_t otherMax = 0;
+
+  if (absZ >= absX && absZ >= absY) {
+    verticalValue = g_accelZ;
+    otherMax = max(absX, absY);
+  } else if (absY >= absX && absY >= absZ) {
+    verticalValue = g_accelY;
+    otherMax = max(absX, absZ);
+  } else {
+    verticalValue = g_accelX;
+    otherMax = max(absY, absZ);
+  }
+
+  // Must have strong vertical component and minimal tilt
+  if (abs(verticalValue) < VERTICAL_THRESHOLD || otherMax > TILT_MAX) {
+    return;  // Not a clear orientation
+  }
+
+  // Determine current orientation
+  int8_t currentOrientation = (verticalValue > 0) ? 1 : -1;
+
+  // Detect flip transition
+  if (lastOrientation != 0 && currentOrientation != lastOrientation) {
+    unsigned long now = millis();
+    if (now - lastFlipTime >= FLIP_DEBOUNCE_MS) {
+      lastFlipTime = now;
+
+      Serial.print("[FLIP] >>> 180-DEGREE FLIP DETECTED <<< (");
+      Serial.print(lastOrientation == 1 ? "NORMAL" : "FLIPPED");
+      Serial.print(" -> ");
+      Serial.print(currentOrientation == 1 ? "NORMAL" : "FLIPPED");
+      Serial.println(")");
+
+      advancePomodoroPhase();
+    }
+  }
+
+  // Update orientation and display flip state
+  lastOrientation = currentOrientation;
+  displayFlipped = (currentOrientation == -1);
+
+  // Reset sensor read flag for next cycle
+  g_sensorRead = false;
 }
 
 
@@ -2378,20 +2883,27 @@ void checkOrientation() {
      P.setZoneEffect(0, false, PA_FLIP_UD);   // Disable vertical flip
    }
   
-   if (currentMode == MODE_CLOCK) {
-     updateClockDisplay();
-   } else if (currentMode == MODE_WEATHER) {
-     // Restart weather scroll
-     startWeatherScroll();
-   } else if (currentMode == MODE_REMINDER) {
-     // Restart reminder scroll
-     if (strlen(reminderDisplayText) > 0) {
-       P.displayClear();
-       P.displayZoneText(0, reminderDisplayText, PA_LEFT, 100, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
-       P.displayAnimate();
-     }
-   }
- }
+    if (currentMode == MODE_CLOCK) {
+      // Flip in clock mode triggers weather display for 15 seconds
+      if (wifiConnected && weatherDataReady && strlen(weatherData) > 0) {
+        Serial.println("[FLIP-WEATHER] Flip detected in clock mode - showing weather for 15 sec");
+        startFlipWeather();
+      } else {
+        updateClockDisplay();
+      }
+    } else if (currentMode == MODE_WEATHER) {
+      // Restart weather scroll
+      startWeatherScroll();
+    } else if (currentMode == MODE_BREAK) {
+      // Restart break scroll with correct direction
+      if (strlen(breakDisplayText) > 0) {
+        P.displayClear();
+        textEffect_t scrollDir = getScrollEffect();
+        P.displayZoneText(0, breakDisplayText, PA_LEFT, 80, 0, scrollDir, scrollDir);
+        P.displayAnimate();
+      }
+    }
+  }
   lastAccelZ = accelZ;
 }
 
@@ -2400,6 +2912,13 @@ void flipDisplayHardware(bool flipped) {
  // Store flip state - actual flip is applied after text rendering
  Serial.print("[FLIP] Hardware flip state: ");
  Serial.println(flipped ? "ENABLED" : "DISABLED");
+}
+
+
+// Helper function to get correct scroll direction based on flip state
+// When flipped, we need PA_SCROLL_RIGHT to maintain visual right-to-left scrolling
+textEffect_t getScrollEffect() {
+  return displayFlipped ? PA_SCROLL_RIGHT : PA_SCROLL_LEFT;
 }
 
 
