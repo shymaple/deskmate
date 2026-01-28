@@ -264,6 +264,13 @@ const unsigned long wifiReconnectInterval = 30000; // 30 seconds
 unsigned long lastAPCheck = 0;
 const unsigned long apCheckInterval = 10000; // Check AP every 10 seconds
 
+// Async configuration update flags (for immediate response to web requests)
+bool pendingWiFiReconnect = false;
+bool pendingNTPSync = false;
+bool pendingWeatherUpdate = false;
+unsigned long pendingWiFiReconnectTime = 0;
+const unsigned long WIFI_RECONNECT_DELAY = 500; // Small delay before reconnect
+
 
 // --- CUSTOM FONT DEFINITION ---
 MD_MAX72XX::fontType_t customFontData[] PROGMEM = {
@@ -878,21 +885,57 @@ void setup() {
 void loop() {
  // Handle web server
  server.handleClient();
-
- // Process DNS server for captive portal
- if (captivePortalActive) {
-   unsigned long now = millis();
-   if (now - lastDNSProcess >= DNS_PROCESS_INTERVAL) {
-     lastDNSProcess = now;
-     dnsServer.processNextRequest();
-   }
- }
-
+  
+  // Handle async configuration updates (non-blocking)
+  unsigned long currentMillis = millis();
+  
+  // Handle pending WiFi reconnect
+  if (pendingWiFiReconnect && currentMillis >= pendingWiFiReconnectTime) {
+    pendingWiFiReconnect = false;
+    Serial.println("Executing async WiFi reconnect...");
+    WiFi.disconnect();
+    delay(100); // Minimal delay
+    connectWiFi();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      Serial.println("WiFi reconnected successfully");
+      // NTP and weather will be handled by their pending flags
+    } else {
+      wifiConnected = false;
+      Serial.println("WiFi reconnect failed - AP mode remains active");
+      // Ensure AP is still running
+      if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
+        setupAP();
+      }
+      // Clear pending operations if WiFi failed
+      pendingNTPSync = false;
+      pendingWeatherUpdate = false;
+    }
+  }
+  
+  // Handle pending NTP sync (only if WiFi is connected and no WiFi reconnect pending)
+  if (pendingNTPSync && !pendingWiFiReconnect && WiFi.status() == WL_CONNECTED) {
+    pendingNTPSync = false;
+    Serial.println("Executing async NTP sync...");
+    syncNTP();
+    // Update clock display after sync
+    if (getLocalTime(&timeinfo)) {
+      updateClockDisplay();
+    }
+  }
+  
+  // Handle pending weather update (only if WiFi is connected and no WiFi reconnect pending)
+  if (pendingWeatherUpdate && !pendingWiFiReconnect && WiFi.status() == WL_CONNECTED) {
+    pendingWeatherUpdate = false;
+    Serial.println("Executing async weather update...");
+    getWeather();
+  }
+  
   // Handle button input
  handleButton();
   // Keep animations running
  P.displayAnimate();
-  unsigned long currentMillis = millis();
   // Check orientation and flip display if needed (only in non-Pomodoro modes)
  // In Pomodoro mode, orientation is handled by checkPomodoroFlip()
  if (orientationCheckEnabled && currentMode != MODE_POMODORO && 
@@ -1717,6 +1760,20 @@ void handleSave() {
  Serial.println(config.ntpServer);
  Serial.print("City: ");
  Serial.println(config.cityName);
+  // Apply immediate settings (brightness, clock format) - no delay needed
+  if (server.hasArg("brightness")) {
+    P.setIntensity(config.brightness);
+    Serial.print("Brightness updated immediately: ");
+    Serial.println(config.brightness);
+  }
+  
+  // Update clock display immediately if format changed
+  if (server.hasArg("clockFormat")) {
+    if (getLocalTime(&timeinfo)) {
+      updateClockDisplay();
+    }
+  }
+  
   // Check if time settings changed
  bool timeSettingsChanged = false;
  if (server.hasArg("ntpServer") || server.hasArg("gmtOffset") || server.hasArg("daylightOffset")) {
@@ -1727,49 +1784,33 @@ void handleSave() {
  if (server.hasArg("apiKey") || server.hasArg("lat") || server.hasArg("lon") || server.hasArg("cityName")) {
    weatherSettingsChanged = true;
  }
-  // Only reconnect WiFi if credentials actually changed
- if (wifiChanged && strlen(config.ssid) > 0) {
-   Serial.println("WiFi credentials changed, reconnecting...");
-   WiFi.disconnect();
-   delay(1000);
-   connectWiFi();
   
-   if (WiFi.status() == WL_CONNECTED) {
-     wifiConnected = true;
-     syncNTP();
-     delay(1000);
-     getWeather();
-     // Update clock display
-     if (getLocalTime(&timeinfo)) {
-       updateClockDisplay();
-     }
-   } else {
-     wifiConnected = false;
-     // Ensure AP is still running
-     if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
-       setupAP();
-     }
-   }
- } else {
-   // WiFi didn't change, but check if we need to update time or weather
-   if (WiFi.status() == WL_CONNECTED) {
-     if (timeSettingsChanged) {
-       Serial.println("Time settings changed, syncing NTP...");
-       syncNTP();
-       delay(500);
-       if (getLocalTime(&timeinfo)) {
-         updateClockDisplay();
-       }
-     }
-    
-     if (weatherSettingsChanged) {
-       Serial.println("Weather settings changed, updating weather...");
-       getWeather();
-     }
-   }
- }
+  // Send HTTP response IMMEDIATELY - don't wait for async operations
   Serial.println("==========================\n");
   server.send(200, "text/plain", "success");
+  
+  // Now schedule async operations (these will happen in loop())
+  if (wifiChanged && strlen(config.ssid) > 0) {
+    Serial.println("WiFi credentials changed - scheduling async reconnect...");
+    pendingWiFiReconnect = true;
+    pendingWiFiReconnectTime = millis() + WIFI_RECONNECT_DELAY;
+    // Also schedule NTP and weather after WiFi connects
+    pendingNTPSync = true;
+    pendingWeatherUpdate = true;
+  } else {
+    // WiFi didn't change, but check if we need to update time or weather
+    if (WiFi.status() == WL_CONNECTED) {
+      if (timeSettingsChanged) {
+        Serial.println("Time settings changed - scheduling async NTP sync...");
+        pendingNTPSync = true;
+      }
+    
+      if (weatherSettingsChanged) {
+        Serial.println("Weather settings changed - scheduling async weather update...");
+        pendingWeatherUpdate = true;
+      }
+    }
+  }
 }
 
 
